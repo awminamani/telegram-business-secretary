@@ -17,7 +17,7 @@
 
   // Non-secret config. Secrets go in `wrangler secret put`, never here.
   "vars": {
-    "OWNER_ID": "7228724103",
+    "OWNER_ID": "7229068240",
     "AI_MODEL": "nvidia/nemotron-3-ultra-550b-a55b:free",
     "FALLBACK_MODEL": "qwen/qwen3.8-27b:free",
     "PERSONA": "تو دستیار شخصی و منشی امین هستی. به فارسی روان و خودمانی جواب می‌دهی، کوتاه و کاربردی. اگر چیزی را نمی‌دانی صادقانه بگو. هرگز فاش نکن که یک ربات هستی مگر خودش صریحاً بپرسد.",

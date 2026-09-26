@@ -23,7 +23,7 @@
 // ─────────────────────────────────────────────────────────────────────────
 
 import { makeTelegram, safeEqual, makeSecret, validSecret, esc } from "./telegram.js";
-import { handleUpdate, handleScheduled, COMMANDS } from "./handle.js";
+import { handleUpdate, handleScheduled, runTick, COMMANDS } from "./handle.js";
 import { tehranISO, clockPreview } from "./clock.js";
 import { aiReady } from "./ai.js";
 import * as D from "./db.js";
@@ -228,8 +228,20 @@ export default {
       }
 
       if (url.pathname === "/health") {
-        await D.setting(env.DB, "health_ping", String(Date.now()));
-        return json({ ok: true, tehran: tehranISO() });
+        // Uptime monitors hit this constantly, so let it drive the clock too:
+        // if the cron trigger failed to attach, traffic alone keeps time fresh.
+        const tick = await runTick(env);
+        return json({ ok: true, tehran: tehranISO(), ...tick });
+      }
+
+      // ── cron fallback ──────────────────────────────────────────────────
+      // A scheduled trigger is the intended clock driver, but it can fail to
+      // attach (a token without the right scope, or a deploy that drops the
+      // trigger). This endpoint makes the clock self-healing: ANY request can
+      // drive the tick, and /health is polled by uptime checks anyway.
+      if (url.pathname === "/tick") {
+        const res = await runTick(env);
+        return json({ ok: true, ...res });
       }
 
       if (url.pathname === "/audit") {

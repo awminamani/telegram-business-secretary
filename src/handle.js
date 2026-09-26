@@ -786,35 +786,55 @@ export async function handleUpdate(ctx, env, update) {
   }
 }
 
-// ── scheduled: the clock + housekeeping ────────────────────────────────
+// ── the tick: clock + housekeeping ──────────────────────────────────────
+// Runs from the cron trigger AND from /health or /tick, because a scheduled
+// trigger can fail to attach (missing scope, or a deploy that drops it). Being
+// able to drive it from ordinary traffic is what makes the clock self-healing.
 
-export async function handleScheduled(ctx, env) {
+export async function runTick(env) {
   const { DB } = env;
-  const tg = makeTelegram(env.BOT_TOKEN);
-  const font = await D.setting(DB, "clock_font", "");
+  const out = { clock: "off", wrote: false, housekeeping: false };
 
+  // 1. the clock
+  const font = await D.setting(DB, "clock_font", "");
   if (font) {
+    out.clock = font;
     const base = stripClock(await D.setting(DB, "clock_base_name", "") || "");
     const want = buildClockName(base, font);
     if (want !== (await D.setting(DB, "clock_applied", ""))) {
       const c = await D.connWithRight(DB, "can_edit_name");
       if (c) {
         try {
+          const tg = makeTelegram(env.BOT_TOKEN);
           await tg.setBusinessAccountName(c.id, want);
           await D.setSetting(DB, "clock_applied", want);
+          out.wrote = true;
         } catch (e) {
+          out.clock_error = e.message;
           console.warn("clock tick failed", e.message);
         }
+      } else {
+        out.clock_error = "can_edit_name not granted";
       }
     }
   }
 
-  // housekeeping — keeps D1 (and the writes) cheap
-  await D.pruneUpdates(DB);
-  await D.pruneDrafts(DB, Number(env.DRAFT_TTL_HOURS || 72));
-  await D.pruneRateLimits(DB);
-  await D.pruneHistory(DB);
-  await D.setSetting(DB, "last_cron", String(Math.floor(Date.now() / 1000)));
+  // 2. housekeeping — but only once a minute even if /health is polled hard
+  const last = Number(await D.setting(DB, "last_cron", "0") || 0);
+  const nowS = Math.floor(Date.now() / 1000);
+  if (nowS - last >= 60) {
+    await D.pruneUpdates(DB);
+    await D.pruneDrafts(DB, Number(env.DRAFT_TTL_HOURS || 72));
+    await D.pruneRateLimits(DB);
+    await D.pruneHistory(DB);
+    await D.setSetting(DB, "last_cron", String(nowS));
+    out.housekeeping = true;
+  }
+  return out;
+}
+
+export async function handleScheduled(ctx, env) {
+  return await runTick(env);
 }
 
 export { tehranISO, COMMANDS };
