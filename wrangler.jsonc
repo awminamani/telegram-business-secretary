@@ -1,0 +1,44 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "telegram-business-secretary",
+  "main": "src/worker.js",
+  "compatibility_date": "2026-02-01",
+  "compatibility_flags": ["nodejs_compat"],
+
+  // D1 holds ALL state — drafts, rules, connections, rate limits, audit log.
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "secretary",
+      "database_id": "REPLACE_WITH_YOUR_D1_ID",
+      "migrations_dir": "migrations"
+    }
+  ],
+
+  // Non-secret config. Secrets go in `wrangler secret put`, never here.
+  "vars": {
+    "OWNER_ID": "7228724103",
+    "AI_MODEL": "nvidia/nemotron-3-ultra-550b-a55b:free",
+    "FALLBACK_MODEL": "qwen/qwen3.8-27b:free",
+    "PERSONA": "تو دستیار شخصی و منشی امین هستی. به فارسی روان و خودمانی جواب می‌دهی، کوتاه و کاربردی. اگر چیزی را نمی‌دانی صادقانه بگو. هرگز فاش نکن که یک ربات هستی مگر خودش صریحاً بپرسد.",
+    "MAX_TOKENS": "600",
+    "HUMAN_DELAY_MIN": "0.8",
+    "HUMAN_DELAY_MAX": "2.4",
+    "COOLDOWN_SECONDS": "2",
+    "CLOCK_FONT": "mono",
+    "RATE_LIMIT_PER_MIN": "20",
+    "WEBHOOK_MAX_CONNECTIONS": "10",
+    "DRAFT_TTL_HOURS": "72"
+  },
+
+  // The clock + a self-heal reconciliation pass. This is what replaces the
+  // "always-on process" that a long-polling bot gets for free.
+  "triggers": {
+    "crons": ["* * * * *"]
+  },
+
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1
+  }
+}
