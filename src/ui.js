@@ -15,10 +15,10 @@ const link = (text, url) => ({ text, url });
 
 // ── the panel ──────────────────────────────────────────────────────────
 
-export function panelHome({ mode, aiOk, model, conns, rules, quick, blocked, stats }) {
+export function panelHome({ mode, aiOk, model, conns, rules, quick, blocked, stats, listenOn = true }) {
   const head =
     `🎛️ <b>Control panel</b>\n` +
-    `Mode: <code>${esc(mode)}</code>\n` +
+    `Mode: <code>${esc(mode)}</code> · 👂 DMs: <b>${listenOn ? "ON" : "OFF"}</b>\n` +
     (aiOk ? `🧠 AI: <code>${esc(model)}</code>\n`
           : `🧠 AI: <b>off</b> <i>(no API key — manual/rules/quick still work)</i>\n`) +
     `Accounts: ${conns} · Rules: ${rules} · Quick: ${quick} · Blocked: ${blocked}\n` +
@@ -29,9 +29,11 @@ export function panelHome({ mode, aiOk, model, conns, rules, quick, blocked, sta
     text: head,
     reply_markup: kb([
       [btn("🤖 AI mode", "m:ai"), btn("✍️ Manual", "m:manual"), btn("🔇 Off", "m:off")],
-      [btn("⚡ Rules", "p:rules"), btn("⚡ Quick", "p:quick"), btn("🚫 Blocked", "p:block")],
-      [btn("👤 Profile", "p:profile"), btn("🕐 Clock", "p:clock")],
-      [btn("🔑 Rights", "p:rights"), btn("📊 Stats", "p:stats")],
+      [btn(listenOn ? "🔇 Turn DM listening OFF" : "👂 Turn DM listening ON", "t:listen"),
+       btn("⚡ Rules", "p:rules"), btn("🚫 Blocked", "p:block")],
+      [btn("⚡ Quick replies", "p:quick"), btn("🕐 Clock", "p:clock")],
+      [btn("👤 Profile", "p:profile"), btn("🔑 Rights", "p:rights"),
+       btn("📊 Stats", "p:stats")],
     ]),
   };
 }
@@ -107,6 +109,9 @@ const HELP_SECTIONS = [
     ["/mode manual", "DMs come to you with Reply / AI-now buttons"],
     ["/mode ai", "the assistant answers DMs by itself"],
     ["/mode off", "ignore all incoming DMs"],
+    ["/listen", "show whether incoming DMs are forwarded to you"],
+    ["/listen off", "stop forwarding DMs — you are not pinged, nobody is auto-answered"],
+    ["/listen on", "resume forwarding DMs"],
     ["/pin ai", "force AI for just this conversation"],
     ["/pin manual", "force yourself for just this conversation"],
     ["/pin off", "follow the global mode again"],
@@ -168,7 +173,7 @@ export function helpText() {
   return intro + body + outro;
 }
 
-export function startText({ chatId, ownerId, mode, conns, aiOk, model }) {
+export function startText({ chatId, ownerId, mode, conns, aiOk, model, listenOn = true }) {
   const ai = aiOk
     ? `✅ ready (<code>${esc(model)}</code>)`
     : "⚠️ off — no API key. Manual mode, /rules and /quick all still work.";
@@ -176,7 +181,7 @@ export function startText({ chatId, ownerId, mode, conns, aiOk, model }) {
     `👋 Gateway active\n\n` +
     `Your chat id: <code>${chatId}</code>\n` +
     `OWNER_ID: <code>${ownerId || "not set"}</code> ${chatId === ownerId ? "✅" : "❌"}\n\n` +
-    `Mode: <code>${esc(mode)}</code>\n` +
+    `Mode: <code>${esc(mode)}</code> · 👂 DMs: <b>${listenOn ? "ON" : "OFF"}</b>\n` +
     `Connected accounts: ${conns}\n` +
     `AI: ${ai}\n\n` +
     `🕐 Tehran now: <code>${clockPreview("mono")}</code>` +

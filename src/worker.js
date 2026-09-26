@@ -218,6 +218,7 @@ export default {
             has_secret: !!hook.has_custom_certificate === false,
           },
           mode: await D.setting(env.DB, "mode", "manual"),
+          dm_listening: (await D.setting(env.DB, "listen_dm", "on")) !== "off",
           clock_font: await D.setting(env.DB, "clock_font", "") || "off",
           tehran: tehranISO(),
           clock: clockPreview(await D.setting(env.DB, "clock_font", "mono")),

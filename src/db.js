@@ -229,6 +229,23 @@ async function setPin(db, key, mode) {
   }
 }
 
+// ── the tick: everything the clock needs, in ONE round trip ───────────
+export async function tickState(db) {
+  const row = await db.prepare(
+    `SELECT
+       (SELECT value FROM settings WHERE key='clock_font')     AS clock_font,
+       (SELECT value FROM settings WHERE key='clock_base_name') AS clock_base_name,
+       (SELECT value FROM settings WHERE key='clock_applied')   AS clock_applied,
+       (SELECT value FROM settings WHERE key='last_cron')       AS last_cron,
+       (SELECT conn_id FROM connections
+         WHERE enabled=1
+           AND json_extract(rights, '$.can_edit_name') = 1
+         ORDER BY updated_at DESC LIMIT 1)                      AS name_conn_id`
+  ).first();
+  return row || {};
+}
+
+
 // ── AI history (bounded) ───────────────────────────────────────────────
 
 const HIST_MAX_PER_THREAD = 40;

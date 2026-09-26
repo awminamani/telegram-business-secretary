@@ -17,7 +17,7 @@ import { makeTelegram, esc, sleep } from "./telegram.js";
 import { aiReply, aiReady } from "./ai.js";
 import * as UI from "./ui.js";
 import {
-  clockPreview, buildClockName, stripClock, tehranISO, FONT_NAMES,
+  clockPreview, buildClockName, stripClock, tehranISO, tehranSeconds, FONT_NAMES,
 } from "./clock.js";
 
 const OWNER = (env) => Number(env.OWNER_ID || 0);
@@ -89,6 +89,21 @@ async function handleBusinessMessage(ctx, env, db, tg, m) {
   if (!conn) return;
   if (!conn.rights?.can_reply) return;
   if (OWNER(env) && m.from_user?.id === OWNER(env)) return;   // never echo the owner
+
+  // ── DM listening off ──
+  // Swallow silently: the message is still marked read (so the owner's badge is
+  // tidy) but they are never pinged and the customer is never auto-answered.
+  // The bot itself stays fully alive for commands, the panel and the clock.
+  if ((await D.setting(db, "listen_dm", "on")) === "off") {
+    log.info(`[dm listening off] ignored a DM from ${m.chat?.id}`);
+    if (conn.rights?.can_read_messages) {
+      try {
+        await tg.readBusinessMessage(conn.id, m.chat.id, m.message_id);
+      } catch { /* non-fatal */ }
+    }
+    return;
+  }
+
   if (await D.isBlocked(db, m.chat.id)) {
     await D.bumpStat(db, "blocked");
     return;
@@ -274,13 +289,14 @@ const COMMANDS = [
   ["name", "account name"], ["bio", "account bio"], ["username", "account username"],
   ["photo", "profile photo"], ["rmphoto", "remove photo"], ["rights", "granted rights"],
   ["test", "health check"], ["cancel", "close draft"], ["forget", "clear AI memory"],
+  ["listen", "turn DM forwarding on/off"],
 ];
 
 async function runCommand(ctx, env, db, tg, chatId, cmd, args) {
   const owner = OWNER(env);
   const guarded = [
     "panel", "clock", "mode", "pin", "rules", "quick", "block", "unblock",
-    "name", "bio", "username", "rmphoto", "forget", "cancel",
+    "name", "bio", "username", "rmphoto", "forget", "cancel", "listen",
   ];
   if (guarded.includes(cmd) && !isOwner(env, chatId)) {
     return tg.sendMessage(chatId, "⛔ Owner only.");
@@ -294,6 +310,7 @@ async function runCommand(ctx, env, db, tg, chatId, cmd, args) {
       await tg.sendMessage(chatId, UI.startText({
         chatId, ownerId: owner, mode, conns,
         aiOk: aiReady(env), model: env.AI_MODEL,
+        listenOn: (await S("listen_dm", "on")) !== "off",
       }), html({ reply_markup: UI.helpKeyboard() }));
       return;
     }
@@ -306,6 +323,7 @@ async function runCommand(ctx, env, db, tg, chatId, cmd, args) {
         `AI: ${aiReady(env) ? `<code>${esc(env.AI_MODEL)}</code>` : "<i>off (no api key)</i>"}\n` +
         `Accounts: ${(await D.allConnections(db)).length}\n` +
         `Clock: <code>${await S("clock_font", "off")}</code> — ${clockPreview(await S("clock_font", "mono"))}\n` +
+        `👂 DM listening: <b>${(await S("listen_dm", "on")) === "off" ? "OFF" : "ON"}</b>\n` +
         `Handled: ${st.dms || 0} DMs (${st.ai || 0} AI / ${st.manual || 0} you / ${st.rules || 0} rules)`,
         html());
     }
@@ -335,6 +353,26 @@ async function runCommand(ctx, env, db, tg, chatId, cmd, args) {
         return `👤 ${esc(c.name || "?")} (<code>${c.user_id}</code>)\nconn <code>${c.id.slice(0, 16)}…</code>\n${rs}`;
       }).join("\n\n");
       return tg.sendMessage(chatId, out, html());
+    }
+    case "listen": {
+      const cur = await D.setting(db, "listen_dm", "on");
+      if (!args.length) {
+        return tg.sendMessage(chatId,
+          `👂 DM listening: <b>${cur === "off" ? "OFF" : "ON"}</b>\n\n` +
+          (cur === "off"
+            ? "Incoming DMs are ignored — you will not be notified and nobody is auto-answered."
+            : "Incoming DMs are forwarded to you with buttons."),
+          html());
+      }
+      const v = args[0].toLowerCase();
+      if (!["on", "off"].includes(v)) return tg.sendMessage(chatId, "❌ Use: /listen on | off");
+      await D.setSetting(db, "listen_dm", v);
+      await D.audit(db, chatId, "listen.set", v);
+      return tg.sendMessage(chatId,
+        v === "off"
+          ? "🔇 DM listening <b>OFF</b> — you will not be pinged.\n<i>The bot stays alive for /panel, commands and the clock.</i>"
+          : "👂 DM listening <b>ON</b>.",
+        html());
     }
     case "cancel":
       if (await D.getReply(db, owner)) {
@@ -556,6 +594,7 @@ async function showPanel(ctx, env, db, tg, chatId, level, editMsgId) {
   const home = UI.panelHome({
     mode, aiOk: aiReady(env), model: env.AI_MODEL,
     conns, rules, quick, blocked, stats,
+    listenOn: (await D.setting(db, "listen_dm", "on")) !== "off",
   });
   const names = ["home", "rules", "quick", "blocked", "profile", "clock"];
   const text = level === 0 ? home.text : `${home.text}\n\n📂 <u>${names[level]}</u>`;
@@ -594,7 +633,7 @@ async function onCallback(ctx, env, db, tg, q) {
   }
 
   // ── panel (owner only) ──
-  if (["m", "p", "rd", "qd", "ub", "ra", "qa", "pr", "cf"].includes(kind)) {
+  if (["m", "p", "rd", "qd", "ub", "ra", "qa", "pr", "cf", "t"].includes(kind)) {
     if (!isOwner(env, q.from?.id)) return ack("⛔ Owner only.", true);
 
     if (kind === "m") {
@@ -603,6 +642,13 @@ async function onCallback(ctx, env, db, tg, q) {
       await D.setSetting(db, "mode", arg);
       await D.audit(db, q.from.id, "mode.set", arg);
       await ack(`✅ Mode: ${arg}`, true);
+      return showPanel(ctx, env, db, tg, chatId, 0, msgId);
+    }
+    if (kind === "t" && arg === "listen") {
+      const now = (await D.setting(db, "listen_dm", "on")) === "off" ? "on" : "off";
+      await D.setSetting(db, "listen_dm", now);
+      await D.audit(db, q.from.id, "listen.set", now);
+      await ack(now === "off" ? "🔇 DM listening OFF — you won't be pinged." : "👂 DM listening ON.", true);
       return showPanel(ctx, env, db, tg, chatId, 0, msgId);
     }
     if (kind === "p") {
@@ -793,36 +839,22 @@ export async function handleUpdate(ctx, env, update) {
 
 export async function runTick(env) {
   const { DB } = env;
-  const out = { clock: "off", wrote: false, housekeeping: false };
-
-  // 1. the clock
-  const font = await D.setting(DB, "clock_font", "");
-  if (font) {
-    out.clock = font;
-    const base = stripClock(await D.setting(DB, "clock_base_name", "") || "");
-    const want = buildClockName(base, font);
-    if (want !== (await D.setting(DB, "clock_applied", ""))) {
-      const c = await D.connWithRight(DB, "can_edit_name");
-      if (c) {
-        try {
-          const tg = makeTelegram(env.BOT_TOKEN);
-          await tg.setBusinessAccountName(c.id, want);
-          await D.setSetting(DB, "clock_applied", want);
-          out.wrote = true;
-        } catch (e) {
-          out.clock_error = e.message;
-          console.warn("clock tick failed", e.message);
-        }
-      } else {
-        out.clock_error = "can_edit_name not granted";
-      }
-    }
-  }
-
-  // 2. housekeeping — but only once a minute even if /health is polled hard
-  const last = Number(await D.setting(DB, "last_cron", "0") || 0);
   const nowS = Math.floor(Date.now() / 1000);
-  if (nowS - last >= 60) {
+  const out = { clock: "off", wrote: false, housekeeping: false, skew_s: 0 };
+
+  // Everything the tick needs in ONE round trip. The previous version issued
+  // four separate settings reads plus a connections read on every tick; this
+  // batches them, which is where most of the D1 request savings come from.
+  const s = await D.tickState(DB);
+
+  // ── skew: how far into the Tehran minute this tick landed ──
+  // 0 = perfect (fired at :00). Cron granularity means this is usually 1-50.
+  // Deriving it from the timezone-converted seconds field keeps the units
+  // straight; mixing a minute value with an epoch remainder does not.
+  out.skew_s = tehranSeconds();
+
+  // ── housekeeping, at most once a minute no matter how often /health is hit ──
+  if (nowS - Number(s.last_cron || 0) >= 60) {
     await D.pruneUpdates(DB);
     await D.pruneDrafts(DB, Number(env.DRAFT_TTL_HOURS || 72));
     await D.pruneRateLimits(DB);
@@ -830,11 +862,62 @@ export async function runTick(env) {
     await D.setSetting(DB, "last_cron", String(nowS));
     out.housekeeping = true;
   }
+
+  // ── the clock ──
+  const font = s.clock_font || "";
+  if (!font) return out;
+  out.clock = font;
+
+  const want = buildClockName(stripClock(s.clock_base_name || ""), font);
+
+  // THE request saving: only call Telegram when the rendered name differs from
+  // what we last wrote. Before, a tick that changed nothing still burned a
+  // setBusinessAccountName call (or a compare against a separately-read value).
+  if (want === (s.clock_applied || "")) return out;
+
+  const c = s.name_conn_id
+    ? { id: s.name_conn_id }
+    : await D.connWithRight(DB, "can_edit_name");
+  if (!c) {
+    out.clock_error = "can_edit_name not granted";
+    return out;
+  }
+  try {
+    const tg = makeTelegram(env.BOT_TOKEN);
+    await tg.setBusinessAccountName(c.id, want);
+    await D.setSetting(DB, "clock_applied", want);
+    out.wrote = true;
+  } catch (e) {
+    out.clock_error = e.message;
+    console.warn("clock tick failed", e.message);
+  }
   return out;
 }
 
 export async function handleScheduled(ctx, env) {
-  return await runTick(env);
+  const out = await runTick(env);
+
+  // ── accuracy: correct a late tick ──
+  // Cron granularity means a tick can land anywhere in the minute. If it landed
+  // in the second half, the name it just wrote is already behind. Re-tick near
+  // the top of the next minute so the visible time is never more than a few
+  // seconds stale. Cheap: runTick() is a no-op when the rendered name matches.
+  const nowS = Math.floor(Date.now() / 1000);
+  const secInMinute = tehranSeconds();   // must match what the clock displays
+  // Past 20s the tick is visibly behind, so always re-tick at the top of the
+  // next minute. That is what pulls the displayed time back to :00-ish instead
+  // of leaving it tens of seconds stale for the whole minute.
+  if (secInMinute >= 20 && env.CATCH_UP !== "off") {
+    const delayMs = (60 - secInMinute + 2) * 1000;
+    if (ctx?.waitUntil) {
+      ctx.waitUntil((async () => {
+        await new Promise((r) => setTimeout(r, delayMs));
+        await runTick(env);
+      })());
+      out.catch_up_in_s = Math.round(delayMs / 1000);
+    }
+  }
+  return out;
 }
 
 export { tehranISO, COMMANDS };

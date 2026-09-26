@@ -19,6 +19,11 @@ export function tehranParts(ms = Date.now()) {
   };
 }
 
+/** Seconds within the current Tehran minute, 0-59. */
+export function tehranSeconds(ms = Date.now()) {
+  return Math.floor((ms / 1000) % 60);
+}
+
 export function tehranISO(ms = Date.now()) {
   const p = tehranParts(ms);
   const z = (n) => String(n).padStart(2, "0");
