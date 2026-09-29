@@ -25,14 +25,9 @@
 import { makeTelegram, safeEqual, makeSecret, validSecret, esc } from "./telegram.js";
 import { handleUpdate, handleScheduled, runTick, COMMANDS } from "./handle.js";
 import { tehranISO, clockPreview } from "./clock.js";
-import { aiReady } from "./ai.js";
 import * as D from "./db.js";
-import { allUsers } from "./users.js";
 
 const MAX_BODY = 1_048_576;      // 1 MiB — Telegram updates are tiny
-// Secret used to HMAC redeem codes. Falls back to WEBHOOK_SECRET so an existing
-// deployment keeps working; set a dedicated CODE_SECRET to separate concerns.
-const codeSecret = (env) => env.CODE_SECRET || env.WEBHOOK_SECRET || "dev-only-secret";
 const ALLOWED_UPDATES = [
   "message", "edited_message", "callback_query", "business_connection",
   "business_message", "edited_business_message", "deleted_business_messages",
@@ -149,7 +144,7 @@ export default {
         // 6. answer IMMEDIATELY; the LLM/send work continues in waitUntil so a
         //    slow response can never make Telegram re-deliver this update.
         ctx.waitUntil(
-          handleUpdate(ctx, { ...env, CODE_SECRET: codeSecret(env) }, update).catch(async (e) => {
+          handleUpdate(ctx, env, update).catch(async (e) => {
             console.error("handler crashed", e);
             await D.audit(env.DB, null, "update.crash", String(e?.message || e));
           })
@@ -210,33 +205,24 @@ export default {
 
       if (url.pathname === "/status") {
         const tg = makeTelegram(env.BOT_TOKEN);
-        let me = null, hook = null;
+        let me = null;
         try { me = await tg.getMe(); } catch (e) { me = { error: e.message }; }
-        try { hook = await tg.getWebhookInfo(); } catch (e) { hook = { error: e.message }; }
         return json({
           bot: me && me.username ? `@${me.username}` : me,
           can_connect_to_business: me?.can_connect_to_business,
-          webhook: hook && {
-            url: hook.url, pending: hook.pending_update_count,
-            last_error: hook.last_error_message,
-            has_secret: !!hook.has_custom_certificate === false,
-          },
-          mode: await D.setting(env.DB, "mode", "manual"),
-          dm_listening: (await D.setting(env.DB, "listen_dm", "on")) !== "off",
-          clock_font: await D.setting(env.DB, "clock_font", "") || "off",
           tehran: tehranISO(),
-          clock: clockPreview(await D.setting(env.DB, "clock_font", "mono")),
-          ai: aiReady(env),
+          clock: clockPreview(await D.setting(env.DB, "clock_font", "") || "mono"),
+          clock_font: await D.setting(env.DB, "clock_font", "") || "off",
           connections: (await D.allConnections(env.DB)).length,
-          users: (await allUsers(env.DB)).length,
-          stats: await D.allStats(env.DB),
+          dm_forwarding: "removed",
+          ai_replies: "removed",
         });
       }
 
       if (url.pathname === "/health") {
         // Uptime monitors hit this constantly, so let it drive the clock too:
         // if the cron trigger failed to attach, traffic alone keeps time fresh.
-        const tick = await runTick({ ...env, CODE_SECRET: codeSecret(env) });
+        const tick = await runTick(env);
         return json({ ok: true, tehran: tehranISO(), ...tick });
       }
 
@@ -246,18 +232,8 @@ export default {
       // trigger). This endpoint makes the clock self-healing: ANY request can
       // drive the tick, and /health is polled by uptime checks anyway.
       if (url.pathname === "/tick") {
-        const res = await runTick({ ...env, CODE_SECRET: codeSecret(env) });
+        const res = await runTick(env);
         return json({ ok: true, ...res });
-      }
-
-      if (url.pathname === "/audit") {
-        // audit trail is sensitive: require the setup token
-        if (!env.SETUP_TOKEN || !safeEqual(url.searchParams.get("t") || "", env.SETUP_TOKEN)) {
-          return json({ ok: false, error: "forbidden" }, 403);
-        }
-        const { results } = await env.DB.prepare(
-          "SELECT at, actor, action, detail FROM audit ORDER BY id DESC LIMIT 100").all();
-        return json({ entries: results });
       }
 
       // landing page
@@ -278,7 +254,7 @@ export default {
   // the cron that stands in for a long-polling bot's background loop
   async scheduled(event, env, ctx) {
     try {
-      await handleScheduled(ctx, { ...env, CODE_SECRET: codeSecret(env) });
+      await handleScheduled(ctx, env);
     } catch (e) {
       console.error("scheduled failed", e);
     }

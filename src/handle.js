@@ -14,8 +14,6 @@
 
 import * as D from "./db.js";
 import { makeTelegram, esc, sleep } from "./telegram.js";
-import { aiReply, aiReady } from "./ai.js";
-import * as UI from "./ui.js";
 import {
   clockPreview, buildClockName, stripClock, tehranISO, tehranSeconds, FONT_NAMES,
 } from "./clock.js";
@@ -27,8 +25,10 @@ const html = (extra = {}) => ({ parse_mode: "HTML", ...extra });
 
 // Callback prefixes handled by the multi-user dashboard layer.
 const MULTI_KINDS = new Set([
-  "t", "m", "p", "cf", "rd", "qd", "ub", "ra", "qa", "pr", "hx",
-  "a", "au", "ap", "ac", "ad", "ng", "nv", "x",
+  "t", "m", "p", "cf", "rd", "qd", "ub", "ra", "qa", "pr", "hx", "x",
+  "a", "au", "ap", "ac", "ad", "ng", "nv",
+  // announcements: an:<target>  as:go  ah:<id>
+  "an", "as", "ah",
 ]);
 
 // ── connection self-heal ───────────────────────────────────────────────
@@ -55,503 +55,106 @@ async function ensureConn(db, tg, connId) {
   }
 }
 
-// ── the forwarded DM ───────────────────────────────────────────────────
+// ── the two clock buttons ──────────────────────────────────────────────
+async function onCallback(ctx, env, db, tg, q) {
+  const kind = (q.data || "").split(":")[0];
+  const arg = (q.data || "").split(":")[1] || "";
+  const uid = q.from?.id;
+  const chatId = q.message?.chat?.id;
+  // Answer FIRST: a callback query is only valid for a few seconds.
+  try { await tg.answerCallback(q.id); } catch { /* expired */ }
 
-async function forwardToOwner(ctx, env, db, tg, conn, m) {
-  // The account that should be notified is the one that owns this business
-  // connection, not a hard-coded chat id — that is what makes multi-user work.
-  const ownerChat = conn.user_chat_id || conn.user_id;
-  const customerId = m.chat.id;
-  const name = m.chat.full_name || m.chat.title || m.from_user?.first_name || "Unknown";
-  const username = m.from_user?.username || m.chat?.username || "";
-  const body = m.text || m.caption || "";
-  const dId = D.draftId(customerId, conn.id);
-
-  await D.saveDraft(db, {
-    id: dId, customer_id: customerId, conn_id: conn.id, name, username,
-    msg_id: m.message_id, text: body,
-  });
-
-  const head = UI.dmHeader({ name, username, customerId, text: "" });
-  const quickRows = await D.listKv(db, "quick");
-  const markup = UI.dmKeyboard(dId, quickRows);
-
-  const text = `${head}${body}`;
-  const common = { ...html({ reply_markup: markup }) };
-  common.reply_markup.inline_keyboard.push([UI.profileButton(username, customerId)]);
-
-  const send = async () => {
-    if (m.text) return tg.sendMessage(ownerChat, text, common);
-    if (m.photo) return tg.sendPhoto(ownerChat, m.photo.at(-1).file_id, { ...common, caption: `${head}🖼️ Photo${m.caption ? "\n" + m.caption : ""}` });
-    if (m.voice) return tg.sendVoice(ownerChat, m.voice.file_id, { ...common, caption: `${head}🎙️ Voice` });
-    if (m.video) return tg.sendVideo(ownerChat, m.video.file_id, { ...common, caption: `${head}🎬 Video` });
-    if (m.document) return tg.sendDocument(ownerChat, m.document.file_id, { ...common, caption: `${head}📄 ${m.document.file_name || "document"}` });
-    if (m.audio) return tg.sendAudio(ownerChat, m.audio.file_id, { ...common, caption: `${head}🎵 Audio` });
-    if (m.sticker) return tg.sendSticker(ownerChat, m.sticker.file_id, { ...common });
-    return tg.sendMessage(ownerChat, `${head}📦 media`, common);
-  };
-  return send();
+  if (kind === "ck" && arg === "toggle") {
+    const cur = await D.setting(db, "clock_font", "", uid);
+    if (cur) return await turnClockOff(env, db, tg, chatId);
+    return await runClock(ctx, env, db, tg, chatId, ["on", "mono"]);
+  }
+  if (kind === "ck" && arg === "fonts") {
+    const rows = FONT_NAMES.map((f) => ([
+      { text: `${f}  ${clockPreview(f)}`, callback_data: `cf:${f}` }]));
+    rows.push([{ text: "◀️ Back", callback_data: "ck:toggle" }]);
+    return tg.sendMessage(chatId, "🎨 <b>Pick a font</b>", html({
+      reply_markup: { inline_keyboard: rows } }));
+  }
+  if (kind === "cf") {
+    // apply a font straight from the preview page
+    const conns = await D.allConnections(db);
+    const c = conns.find((x) => x.rights?.can_edit_name);
+    if (!c) return tg.sendMessage(chatId, "❌ can_edit_name not granted.", html());
+    if (!(await D.setting(db, "clock_base_name", "", uid))) {
+      await D.setSetting(db, "clock_base_name", "Amin", uid);
+    }
+    const next = buildClockName(await D.setting(db, "clock_base_name", "", uid), arg);
+    await D.setSetting(db, "clock_font", arg, uid);
+    await D.setSetting(db, "clock_applied", next, uid);
+    try { await tg.setBusinessAccountName(c.id, next); }
+    catch (e) { return tg.sendMessage(chatId, `❌ ${esc(e.message)}`, html()); }
+    return tg.sendMessage(chatId,
+      `🕐 Clock <b>ON</b> — your name is now <b>${esc(next)}</b>.\n` +
+      `Updates every minute (Tehran).`, html());
+  }
 }
 
+// ── inbound DMs: nothing is read, stored, forwarded or answered ────────
 async function handleBusinessMessage(ctx, env, db, tg, m) {
+  // DM forwarding and AI replies were removed. A customer message is marked
+  // read (so the badge stays tidy) and then dropped. Nothing is stored.
   const conn = await ensureConn(db, tg, m.business_connection_id);
-  if (!conn) return;
-  if (!conn.rights?.can_reply) return;
-  if (OWNER(env) && m.from_user?.id === OWNER(env)) return;   // never echo the owner
-
-  // Per-user settings: the connection's user_id is the account that receives
-  // these DMs, so their listen/mode/clock are used — not the global ones.
-  const uid = conn.user_id;
-
-  // ── DM listening off (per user) ──
-  // Swallow silently: the message is still marked read (so the badge is tidy)
-  // but the owner is never pinged and the customer is never auto-answered.
-  if ((await D.setting(db, "listen_dm", "on", uid)) === "off") {
-    console.info(`[dm listening off] ignored a DM from ${m.chat?.id}`);
-    if (conn.rights?.can_read_messages) {
-      try {
-        await tg.readBusinessMessage(conn.id, m.chat.id, m.message_id);
-      } catch { /* non-fatal */ }
-    }
-    return;
-  }
-
-  if (await D.isBlocked(db, m.chat.id)) {
-    await D.bumpStat(db, "blocked");
-    return;
-  }
-  await D.bumpStat(db, "dms");
-
-  if (conn.rights?.can_read_messages) {
+  if (conn?.rights?.can_read_messages) {
     try {
       await tg.readBusinessMessage(conn.id, m.chat.id, m.message_id);
     } catch { /* non-fatal */ }
   }
-
-  const pinKey = `${conn.id}:${m.chat.id}`;
-  const mode = (await D.getPin(db, pinKey)) || (await D.setting(db, "mode", "manual", uid));
-  if (mode === "off") return;
-
-  const text = m.text || m.caption || "";
-
-  // rule hit: instant, free, and needs no AI
-  if (text) {
-    const rules = await D.listKv(db, "rules");
-    const lower = text.toLowerCase();
-    const hit = rules.find((r) => lower.includes(String(r.kw).toLowerCase()));
-    if (hit) {
-      await D.bumpStat(db, "rules");
-      try {
-        await tg.sendMessage(m.chat.id, hit.reply, { business_connection_id: conn.id });
-        if ((await D.setting(db, "notify_ai", "1", uid)) === "1") {
-          await tg.sendMessage(conn.user_chat_id || uid, `⚡ Rule answered for <b>${esc(m.chat.full_name || "user")}</b>:\n${esc(hit.reply)}`, html());
-        }
-      } catch { /* reported upstream */ }
-      return;
-    }
-  }
-
-  // AI mode — but degrade to manual when there is no key rather than dropping DMs
-  let effective = mode;
-  if (effective === "ai" && !aiReady(env)) {
-    effective = "manual";
-    await D.setSetting(db, "mode", "manual", uid);
-  }
-  if (effective === "ai") {
-    if (!text) return forwardToOwner(ctx, env, db, tg, conn, { ...m, text: `${text}📦 media`, caption: null });
-    const key = `${conn.id}:${m.chat.id}`;
-    const cdKey = String(m.chat.id);
-    const last = Number(await D.setting(db, `cd:${cdKey}`, "0"));
-    if (Date.now() / 1000 - last < Number(env.COOLDOWN_SECONDS || 2)) return;
-    await D.setSetting(db, `cd:${cdKey}`, String(Math.floor(Date.now() / 1000)));
-    await D.histAdd(db, key, "user", text);
-
-    let stop = false;
-    const typing = (async () => {
-      while (!stop) {
-        try { await tg.sendChatAction(m.chat.id, "typing", conn.id); } catch { break; }
-        await sleep(4000);
-      }
-    })();
-
-    const reply = await aiReply(env, { history: await D.histGet(db, key), text });
-    stop = true;
-    await typing;
-
-    if (!reply) {
-      return forwardToOwner(ctx, env, db, tg, conn,
-        { ...m, text: `⚠️ ${aiReady(env) ? "AI returned nothing" : "AI is off (no API key)"}\n${text}`, caption: null });
-    }
-    await D.histAdd(db, key, "assistant", reply);
-    await sleepJitter(env);
-    try {
-      // no parse_mode: an LLM stray "_" must never cost us the reply
-      await tg.sendMessage(m.chat.id, reply, { business_connection_id: conn.id });
-      await D.bumpStat(db, "ai");
-      if ((await D.setting(db, "notify_ai", "1", uid)) === "1") {
-        await tg.sendMessage(conn.user_chat_id || uid, `🤖 AI → <b>${esc(m.chat.full_name || "user")}</b>\n${esc(reply)}`, html());
-      }
-    } catch (e) {
-      return forwardToOwner(ctx, env, db, tg, conn, { ...m, text: `⚠️ send failed: ${e.message}`, caption: null });
-    }
-    return;
-  }
-
-  // manual
-  return forwardToOwner(ctx, env, db, tg, conn, m);
-}
-
-async function sleepJitter(env) {
-  const lo = Number(env.HUMAN_DELAY_MIN || 0.8) * 1000;
-  const hi = Number(env.HUMAN_DELAY_MAX || 2.4) * 1000;
-  await sleep(lo + Math.random() * (hi - lo));
-}
-
-// ── owner messages / commands ──────────────────────────────────────────
-
-async function deliverReply(ctx, env, db, tg, st, text) {
-  try {
-    await tg.sendMessage(st.customer_id, text, { business_connection_id: st.conn_id });
-    await D.bumpStat(db, "manual");
-    await D.clearReply(db, OWNER(env));
-    await tg.sendMessage(OWNER(env), "✅ Delivered.");
-    return true;
-  } catch (e) {
-    // keep the draft open so the owner can retry
-    await tg.sendMessage(OWNER(env), `❌ Delivery failed: ${esc(e.message)}`);
-    return false;
-  }
-}
-
-async function handleOwnerText(ctx, env, db, tg, m) {
-  const owner = OWNER(env);
-
-  // ── multi-user guided input FIRST (redeem / new code / per-user settings) ──
-  if (m.text) {
-    try {
-      const { setTelegram, onGuided } = await import("./multiuser.js");
-      setTelegram(tg);
-      if (await onGuided(env, db, tg, OWNER(env), OWNER(env), m.text)) return;
-    } catch (e) { console.warn("guided input failed", e.message); }
-  }
-
-  // guided input from the panel (Add rule / Add quick / profile fields)
-  const awaitKey = await D.setting(db, "_await", "", owner);
-  if (awaitKey && m.text) {
-    await D.setSetting(db, "_await", "");
-    const raw = m.text.trim();
-    const [what, ...restRaw] = awaitKey.split("|");
-    const val = restRaw.join("|");
-    if (what === "rule" || what === "quick") {
-      const idx = raw.indexOf("=");
-      if (idx < 0) {
-        return tg.sendMessage(owner, "❌ Format:  <code>keyword = reply</code>", html());
-      }
-      const k = raw.slice(0, idx).trim();
-      const v = raw.slice(idx + 1).trim();
-      await D.putKv(db, what, what === "rule" ? k.toLowerCase() : k.slice(0, 20), v);
-      await tg.sendMessage(owner, `✅ Saved <b>${esc(k)}</b>`, html());
-      return;
-    }
-    const conn = await D.connWithRight(db, what === "/username" ? "can_edit_username" : "can_edit_bio");
-    if (what === "/name") {
-      const c = await D.connWithRight(db, "can_edit_name");
-      if (!c) return tg.sendMessage(owner, "❌ can_edit_name not granted.");
-      const [first, last] = val.split("|").map((s) => s.trim());
-      try {
-        await tg.setBusinessAccountName(c.id, first.slice(0, 64), last?.slice(0, 64) || undefined);
-        return tg.sendMessage(owner, "✅ Name changed.");
-      } catch (e) { return tg.sendMessage(owner, `❌ ${esc(e.message)}`); }
-    }
-    if (what === "/bio") {
-      const c = await D.connWithRight(db, "can_edit_bio");
-      if (!c) return tg.sendMessage(owner, "❌ can_edit_bio not granted.");
-      try {
-        await tg.setBusinessAccountBio(c.id, val.slice(0, 140));
-        return tg.sendMessage(owner, "✅ Bio changed.");
-      } catch (e) { return tg.sendMessage(owner, `❌ ${esc(e.message)}`); }
-    }
-    if (what === "/username") {
-      const c = await D.connWithRight(db, "can_edit_username");
-      if (!c) return tg.sendMessage(owner, "❌ can_edit_username not granted.");
-      try {
-        await tg.setBusinessAccountUsername(c.id, val.replace(/^@/, "").slice(0, 32) || null);
-        return tg.sendMessage(owner, "✅ Username changed.");
-      } catch (e) { return tg.sendMessage(owner, `❌ ${esc(e.message)}`); }
-    }
-    if (what === "/photo") return handlePhoto(ctx, env, db, tg, m);
-  }
-
-  const st = await D.getReply(db, owner);
-  if (st && m.text) {
-    if (st.mode === "ai") {
-      const key = `${st.conn_id}:${st.customer_id}`;
-      await D.histAdd(db, key, "user", m.text);
-      const reply = await aiReply(env, { history: await D.histGet(db, key), text: m.text });
-      if (!reply) {
-        return tg.sendMessage(owner, aiReady(env) ? "⚠️ AI returned nothing." : "⚠️ AI is off — no API key.");
-      }
-      await D.histAdd(db, key, "assistant", reply);
-      return deliverReply(ctx, env, db, tg, st, reply);
-    }
-    return deliverReply(ctx, env, db, tg, st, m.text);
-  }
-
-  return tg.sendMessage(owner, "No open draft — press ✍️ Reply on a forwarded DM.\nTip: tap 🎛️ in /panel.");
 }
 
 // ── commands ───────────────────────────────────────────────────────────
+// Only the clock is kept. DM forwarding, drafts, AI replies, keyword rules,
+// quick replies, the blocklist and the multi-user panel were all removed:
+// the bot no longer sees or answers anybody's messages.
 
 const COMMANDS = [
-  ["start", "status + menu"], ["help", "commands"], ["panel", "button control panel"],
-  ["clock", "Tehran clock in your name"], ["mode", "manual | ai | off"],
-  ["pin", "pin this thread"], ["rules", "auto-replies"], ["quick", "quick replies"],
-  ["block", "block a spammer"], ["unblock", "unblock"], ["stats", "numbers"],
-  ["name", "account name"], ["bio", "account bio"], ["username", "account username"],
-  ["photo", "profile photo"], ["rmphoto", "remove photo"], ["rights", "granted rights"],
-  ["test", "health check"], ["cancel", "close draft"], ["forget", "clear AI memory"],
-  ["listen", "turn DM forwarding on/off"],
-  ["home", "open your button dashboard"], ["admin", "admin dashboard (admins)"],
-  ["redeem", "redeem a plan code"],
+  ["start", "status + clock control"],
+  ["clock", "turn the Tehran clock on/off and pick a font"],
+  ["help", "what this bot does"],
+  ["test", "health check"],
 ];
 
 async function runCommand(ctx, env, db, tg, chatId, cmd, args) {
-  const owner = OWNER(env);
-  const guarded = [
-    "panel", "clock", "mode", "pin", "rules", "quick", "block", "unblock",
-    "name", "bio", "username", "rmphoto", "forget", "cancel", "listen",
-  ];
-  if (guarded.includes(cmd) && !isOwner(env, chatId)) {
-    return tg.sendMessage(chatId, "⛔ Owner only.");
-  }
-  const S = (k, d = null) => D.setting(db, k, d);
+  const uid = chatId;
+  const font = await D.setting(db, "clock_font", "", uid);
 
-  switch (cmd) {
-    case "start": {
-      const conns = (await D.allConnections(db)).length;
-      const mode = await S("mode", "manual");
-      await tg.sendMessage(chatId, UI.startText({
-        chatId, ownerId: owner, mode, conns,
-        aiOk: aiReady(env), model: env.AI_MODEL,
-        listenOn: (await S("listen_dm", "on")) !== "off",
-      }), html({ reply_markup: UI.helpKeyboard() }));
-      return;
-    }
-    case "help":
-      return tg.sendMessage(chatId, UI.helpText(), html());
-    case "test": {
-      const st = await D.allStats(db);
-      return tg.sendMessage(chatId,
-        `✅ Online\nMode: <code>${esc(await S("mode", "manual"))}</code>\n` +
-        `AI: ${aiReady(env) ? `<code>${esc(env.AI_MODEL)}</code>` : "<i>off (no api key)</i>"}\n` +
-        `Accounts: ${(await D.allConnections(db)).length}\n` +
-        `Clock: <code>${await S("clock_font", "off")}</code> — ${clockPreview(await S("clock_font", "mono"))}\n` +
-        `👂 DM listening: <b>${(await S("listen_dm", "on")) === "off" ? "OFF" : "ON"}</b>\n` +
-        `Handled: ${st.dms || 0} DMs (${st.ai || 0} AI / ${st.manual || 0} you / ${st.rules || 0} rules)`,
-        html());
-    }
-    case "stats": {
-      const st = await D.allStats(db);
-      return tg.sendMessage(chatId,
-        `📊 Stats\nDM received: ${st.dms || 0}\nAI answered: ${st.ai || 0}\n` +
-        `You answered: ${st.manual || 0}\nRule hits: ${st.rules || 0}\nBlocked: ${st.blocked || 0}`,
-        html());
-    }
-    case "mode": {
-      if (!args.length) return tg.sendMessage(chatId, `Mode: <code>${esc(await S("mode", "manual"))}</code>`);
-      const m = args[0].toLowerCase();
-      if (!["manual", "ai", "off"].includes(m)) return tg.sendMessage(chatId, "❌ Use: manual | ai | off");
-      if (m === "ai" && !aiReady(env)) {
-        return tg.sendMessage(chatId, "⚠️ AI mode is off because no API key is set.\nEverything else still works: manual mode, /rules, /quick, /block, profile editing.", html());
-      }
-      await S("mode", m);
-      return tg.sendMessage(chatId, `✅ Mode: <code>${m}</code>`, html());
-    }
-    case "panel": return showPanel(ctx, env, db, tg, chatId, 0, chatId);
-    case "rights": {
-      const list = await D.allConnections(db);
-      if (!list.length) return tg.sendMessage(chatId, "⚠️ No account connected.\nSettings → Business → Chatbots");
-      const out = list.map((c) => {
-        const rs = Object.entries(c.rights || {}).map(([k, v]) => `  ${v ? "✅" : "❌"} ${k}`).join("\n");
-        return `👤 ${esc(c.name || "?")} (<code>${c.user_id}</code>)\nconn <code>${c.id.slice(0, 16)}…</code>\n${rs}`;
-      }).join("\n\n");
-      return tg.sendMessage(chatId, out, html());
-    }
-    case "home":
-    case "menu": {
-      const { setTelegram, renderUserHome } = await import("./multiuser.js");
-      setTelegram(tg);
-      return renderUserHome(env, db, chatId, chatId);
-    }
-    case "admin": {
-      const { setTelegram, userContext, showPanel } = await import("./multiuser.js");
-      setTelegram(tg);
-      const ent = await userContext(env, db, chatId);
-      if (!ent.isAdmin) return tg.sendMessage(chatId, "⛔ Admin only.", html());
-      return showPanel(env, db, tg, chatId, chatId, "admin");
-    }
-    case "redeem": {
-      await D.setSetting(db, "_await", "redeem", chatId);
-      return tg.sendMessage(chatId, "🎟 Send me your code.", html());
-    }
-    case "listen": {
-      const cur = await D.setting(db, "listen_dm", "on");
-      if (!args.length) {
-        return tg.sendMessage(chatId,
-          `👂 DM listening: <b>${cur === "off" ? "OFF" : "ON"}</b>\n\n` +
-          (cur === "off"
-            ? "Incoming DMs are ignored — you will not be notified and nobody is auto-answered."
-            : "Incoming DMs are forwarded to you with buttons."),
-          html());
-      }
-      const v = args[0].toLowerCase();
-      if (!["on", "off"].includes(v)) return tg.sendMessage(chatId, "❌ Use: /listen on | off");
-      await D.setSetting(db, "listen_dm", v);
-      await D.audit(db, chatId, "listen.set", v);
-      return tg.sendMessage(chatId,
-        v === "off"
-          ? "🔇 DM listening <b>OFF</b> — you will not be pinged.\n<i>The bot stays alive for /panel, commands and the clock.</i>"
-          : "👂 DM listening <b>ON</b>.",
-        html());
-    }
-    case "cancel":
-      if (await D.getReply(db, owner)) {
-        await D.clearReply(db, owner);
-        return tg.sendMessage(chatId, "📥 Draft closed.");
-      }
-      return tg.sendMessage(chatId, "No open draft.");
-    case "forget": {
-      const st = await D.getReply(db, owner);
-      if (st) await D.histForget(db, `${st.conn_id}:${st.customer_id}`);
-      return tg.sendMessage(chatId, "🧹 AI memory cleared.");
-    }
-    case "rules": {
-      if (!args.length) {
-        const list = await D.listKv(db, "rules");
-        const body = list.length ? list.map((r) => `• <code>${esc(r.kw)}</code> → ${esc(r.reply)}`).join("\n") : "(none)";
-        return tg.sendMessage(chatId, `📌 Auto-reply rules\n${body}\n\nAdd: <code>/rules add سلام = درود</code>`, html());
-      }
-      if (args[0].toLowerCase() === "add" && args.length >= 2) {
-        const joined = args.slice(1).join(" ");
-        const i = joined.indexOf("=");
-        if (i < 0) return tg.sendMessage(chatId, "❌ Format: <code>/rules add k = r</code>", html());
-        await D.putKv(db, "rules", joined.slice(0, i).trim().toLowerCase(), joined.slice(i + 1).trim());
-        return tg.sendMessage(chatId, "✅ Rule added.", html());
-      }
-      if (args[0].toLowerCase() === "del" && args.length >= 2) {
-        await D.delKv(db, "rules", args.slice(1).join(" ").trim().toLowerCase());
-        return tg.sendMessage(chatId, "🗑 Removed.", html());
-      }
-      return tg.sendMessage(chatId, "Usage: /rules add k = r | /rules del k");
-    }
-    case "quick": {
-      if (!args.length) {
-        const list = await D.listKv(db, "quick");
-        const body = list.length ? list.map((r) => `<code>${esc(r.name)}</code> → ${esc(r.text)}`).join("\n") : "(none)";
-        return tg.sendMessage(chatId, `⚡ Quick replies\n${body}\n\nAdd: <code>/quick سلام = سلام داداش</code>`, html());
-      }
-      const joined = args.join(" ");
-      if (/^del\s+/i.test(joined)) {
-        await D.delKv(db, "quick", joined.replace(/^del\s+/i, "").trim());
-        return tg.sendMessage(chatId, "🗑 Removed.", html());
-      }
-      const i = joined.indexOf("=");
-      if (i < 0) return tg.sendMessage(chatId, "❌ Format: <code>/quick name = text</code>", html());
-      await D.putKv(db, "quick", joined.slice(0, i).trim().slice(0, 20), joined.slice(i + 1).trim());
-      return tg.sendMessage(chatId, "⚡ Added.", html());
-    }
-    case "block":
-      if (!args.length) {
-        const ids = await D.listBlocked(db);
-        return tg.sendMessage(chatId, `Blocked: ${ids.join(", ") || "(none)"}\nUsage: <code>/block &lt;id&gt;</code>`, html());
-      }
-      await D.blockUser(db, args[0]);
-      return tg.sendMessage(chatId, `🚫 Blocked <code>${esc(args[0])}</code>`, html());
-    case "unblock":
-      if (args[0]) {
-        await D.unblockUser(db, args[0]);
-        return tg.sendMessage(chatId, `✅ Unblocked <code>${esc(args[0])}</code>`, html());
-      }
-      return tg.sendMessage(chatId, "Not blocked.");
-    case "pin": {
-      const st = await D.getReply(db, owner);
-      if (!st) return tg.sendMessage(chatId, "⚠️ Press ✍️ Reply on a DM first.");
-      if (!args.length) return tg.sendMessage(chatId, "Usage: /pin ai | manual | off");
-      const w = args[0].toLowerCase();
-      if (!["ai", "manual", "off"].includes(w)) return tg.sendMessage(chatId, "❌ Use: ai | manual | off");
-      if (w === "ai" && !aiReady(env)) {
-        return tg.sendMessage(chatId, "⚠️ AI is off — no API key.", html());
-      }
-      await D.setPin(db, `${st.conn_id}:${st.customer_id}`, w === "off" ? null : w);
-      return tg.sendMessage(chatId, `✅ This thread: <code>${w}</code>`, html());
-    }
-    case "name": {
-      if (!args.length) return tg.sendMessage(chatId, "Usage: <code>/name First | Last</code>", html());
-      const c = await D.connWithRight(db, "can_edit_name");
-      if (!c) return tg.sendMessage(chatId, "❌ can_edit_name not granted.");
-      const joined = args.join(" ");
-      const [first, last] = joined.split("|").map((s) => s.trim());
-      try {
-        await tg.setBusinessAccountName(c.id, first.slice(0, 64), last?.slice(0, 64) || undefined);
-        return tg.sendMessage(chatId, "✅ Name changed.", html());
-      } catch (e) { return tg.sendMessage(chatId, `❌ ${esc(e.message)}`, html()); }
-    }
-    case "bio": {
-      if (!args.length) return tg.sendMessage(chatId, "Usage: <code>/bio your bio</code>", html());
-      const c = await D.connWithRight(db, "can_edit_bio");
-      if (!c) return tg.sendMessage(chatId, "❌ can_edit_bio not granted.");
-      try {
-        await tg.setBusinessAccountBio(c.id, args.join(" ").slice(0, 140));
-        return tg.sendMessage(chatId, "✅ Bio changed.", html());
-      } catch (e) { return tg.sendMessage(chatId, `❌ ${esc(e.message)}`, html()); }
-    }
-    case "username": {
-      if (!args.length) return tg.sendMessage(chatId, "Usage: <code>/username limoo</code>", html());
-      const c = await D.connWithRight(db, "can_edit_username");
-      if (!c) return tg.sendMessage(chatId, "❌ can_edit_username not granted.");
-      try {
-        await tg.setBusinessAccountUsername(c.id, args.join(" ").replace(/^@/, "").slice(0, 32) || null);
-        return tg.sendMessage(chatId, "✅ Username changed.", html());
-      } catch (e) { return tg.sendMessage(chatId, `❌ ${esc(e.message)}`, html()); }
-    }
-    case "photo": return handlePhoto(ctx, env, db, tg, { ...arguments[4] });
-    case "rmphoto": {
-      const c = await D.connWithRight(db, "can_edit_profile_photo");
-      if (!c) return tg.sendMessage(chatId, "❌ not granted.");
-      try {
-        await tg.removeBusinessAccountProfilePhoto(c.id);
-        return tg.sendMessage(chatId, "✅ Photo removed.", html());
-      } catch (e) { return tg.sendMessage(chatId, `❌ ${esc(e.message)}`, html()); }
-    }
-    case "clock": return runClock(ctx, env, db, tg, chatId, args);
-    default:
-      return tg.sendMessage(chatId, "Unknown command. Try /help");
+  if (cmd === "start" || cmd === "help") {
+    return tg.sendMessage(chatId,
+      `🕐 <b>Tehran Clock</b>\n\n` +
+      `This bot does one thing: it shows the current Tehran time in your ` +
+      `Telegram display name, updated every minute.\n\n` +
+      `Status: ${font ? `<b>ON</b> (${esc(font)}) — ${clockPreview(font)}`
+                     : "<b>OFF</b>"}\n` +
+      `Tehran now: <code>${clockPreview(font || "mono")}</code>\n\n` +
+      `<b>Commands</b>\n` +
+      `/clock on &lt;font&gt; — turn it on, e.g. <code>/clock on mono</code>\n` +
+      `/clock fonts — preview every style\n` +
+      `/clock off — remove it, your name returns\n` +
+      `/start — this message\n\n` +
+      `<i>DM forwarding and AI replies are removed. Nobody's messages are read ` +
+      `or answered.</i>`,
+      html({ reply_markup: { inline_keyboard: [
+        [{ text: font ? "🔴 Clock OFF" : "🕐 Turn clock ON", callback_data: "ck:toggle" }],
+        [{ text: "🎨 Fonts", callback_data: "ck:fonts" }],
+      ] } }));
   }
-}
 
-async function handlePhoto(ctx, env, db, tg, m) {
-  const c = await D.connWithRight(db, "can_edit_profile_photo");
-  if (!c) return tg.sendMessage(OWNER(env), "❌ can_edit_profile_photo not granted.", html());
-  const photos = (m?.photo || []).filter((p) => !p.file_size || p.file_size < 20_000_000);
-  if (!photos.length) {
-    return tg.sendMessage(OWNER(env), "Send the photo with <code>/photo</code> in the caption.", html());
+  if (cmd === "test") {
+    return tg.sendMessage(chatId,
+      `✅ Online\nClock: ${font ? `<code>${esc(font)}</code> ${clockPreview(font)}` : "<b>off</b>"}\n` +
+      `Tehran: <code>${tehranISO()}</code>\n` +
+      `DM forwarding: <b>removed</b>\nAI replies: <b>removed</b>`,
+      html());
   }
-  try {
-    const f = await fetch(`https://api.telegram.org/file/bot${tg.__token}/file/${photos.at(-1).file_id}`);
-    const blob = await f.arrayBuffer();
-    // upload as multipart/FormData
-    const form = new FormData();
-    form.append("business_connection_id", c.id);
-    form.append("photo", new Blob([blob]), "photo.jpg");
-    const res = await fetch(`https://api.telegram.org/bot${tg.__token}/setBusinessAccountProfilePhoto`, {
-      method: "POST", body: form,
-    });
-    const data = await res.json();
-    if (!data.ok) throw new Error(data.description || "upload failed");
-    return tg.sendMessage(OWNER(env), "✅ Profile photo changed.", html());
-  } catch (e) {
-    return tg.sendMessage(OWNER(env), `❌ ${esc(e.message)}`, html());
-  }
+
+  if (cmd === "clock") return runClock(ctx, env, db, tg, chatId, args);
+
+  return tg.sendMessage(chatId, "Unknown command. Send /start.", html());
 }
 
 // ── the clock (also runs from cron) ────────────────────────────────────
@@ -572,6 +175,18 @@ async function runClock(ctx, env, db, tg, chatId, args) {
     return tg.sendMessage(chatId, `🕐 <b>Font previews</b> (live Tehran time)\n\n${rows.join("\n")}`, html());
   }
   if (a === "off") return turnClockOff(env, db, tg, chatId);
+  if (a === "" || a === "on") {
+    const cur = await D.setting(db, "clock_font", "", uid);
+    return tg.sendMessage(chatId,
+      cur ? `🕐 Clock <b>ON</b> — font <code>${esc(cur)}</code> ${clockPreview(cur)}\n\n` +
+           `<b>Change it</b>\n` +
+           `/clock on &lt;font&gt; e.g. <code>/clock on mono</code>\n` +
+           `/clock fonts — preview all\n` +
+           `/clock off — remove it`
+         : `🕐 Clock is <b>OFF</b>.\n\nTurn it on:\n` +
+           `<code>/clock on mono</code>  ·  or send <code>/clock fonts</code>`,
+      html());
+  }
 
   let font = a === "on" ? (args[1] || "").toLowerCase() : a;
   if (!FONT_NAMES.includes(font)) {
@@ -624,199 +239,11 @@ async function turnClockOff(env, db, tg, chatId) {
 
 // ── the panel renderer ─────────────────────────────────────────────────
 
-async function showPanel(ctx, env, db, tg, chatId, level, editMsgId) {
-  const stats = await D.allStats(db);
-  const conns = (await D.allConnections(db)).length;
-  const rules = (await D.listKv(db, "rules")).length;
-  const quick = (await D.listKv(db, "quick")).length;
-  const blocked = (await D.listBlocked(db)).length;
-  const mode = await D.setting(db, "mode", "manual");
-  const home = UI.panelHome({
-    mode, aiOk: aiReady(env), model: env.AI_MODEL,
-    conns, rules, quick, blocked, stats,
-    listenOn: (await D.setting(db, "listen_dm", "on")) !== "off",
-  });
-  const names = ["home", "rules", "quick", "blocked", "profile", "clock"];
-  const text = level === 0 ? home.text : `${home.text}\n\n📂 <u>${names[level]}</u>`;
 
-  let markup;
-  if (level === 0) markup = home.reply_markup;
-  else if (level === 1) markup = { inline_keyboard: UI.panelRules(await D.listKv(db, "rules")) };
-  else if (level === 2) markup = { inline_keyboard: UI.panelQuick(await D.listKv(db, "quick")) };
-  else if (level === 3) markup = { inline_keyboard: UI.panelBlocked(await D.listBlocked(db)) };
-  else if (level === 4) markup = { inline_keyboard: UI.panelProfile() };
-  else markup = { inline_keyboard: UI.panelClock(await D.setting(db, "clock_font", "")) };
-
-  // Edit the PANEL message only — never a forwarded DM.
-  if (editMsgId) {
-    try {
-      return await tg.editMessageText(text, { chat_id: chatId, message_id: editMsgId, ...html({ reply_markup: markup }) });
-    } catch { /* fall through to a fresh message */ }
-  }
-  return tg.sendMessage(chatId, text, html({ reply_markup: markup }));
-}
 
 // ── callback router ────────────────────────────────────────────────────
 
-async function onCallback(ctx, env, db, tg, q) {
-  const owner = OWNER(env);
-  const parts = String(q.data || "").split(":");
-  const kind = parts[0];
-  const arg = parts[1] || "";
-  const chatId = q.message?.chat?.id ?? owner;
-  const msgId = q.message?.message_id;
-  const ack = (text, alert = false) => tg.answerCallback(q.id, text, alert);
 
-  // ── multi-user dashboards own these prefixes ──
-  // Single-letter kinds that the legacy panel also uses are handled here, so
-  // the new button UI works for every user, not just the owner.
-  if (MULTI_KINDS.has(kind)) {
-    const { setTelegram, onDashCallback } = await import("./multiuser.js");
-    setTelegram(tg);
-    return onDashCallback(env, db, q, q.from?.id ?? owner);
-  }
-
-  if (kind === "hx") {
-    await ack();
-    return tg.sendMessage(chatId, UI.helpText(), html());
-  }
-
-  // ── panel (owner only) ──
-  if (["m", "p", "rd", "qd", "ub", "ra", "qa", "pr", "cf", "t"].includes(kind)) {
-    if (!isOwner(env, q.from?.id)) return ack("⛔ Owner only.", true);
-
-    if (kind === "m") {
-      if (arg === "ai" && !aiReady(env)) return ack("⚠️ No API key — AI is off.", true);
-      if (!["ai", "manual", "off"].includes(arg)) return ack("Bad mode", true);
-      await D.setSetting(db, "mode", arg);
-      await D.audit(db, q.from.id, "mode.set", arg);
-      await ack(`✅ Mode: ${arg}`, true);
-      return showPanel(ctx, env, db, tg, chatId, 0, msgId);
-    }
-    if (kind === "t" && arg === "listen") {
-      const now = (await D.setting(db, "listen_dm", "on")) === "off" ? "on" : "off";
-      await D.setSetting(db, "listen_dm", now);
-      await D.audit(db, q.from.id, "listen.set", now);
-      await ack(now === "off" ? "🔇 DM listening OFF — you won't be pinged." : "👂 DM listening ON.", true);
-      return showPanel(ctx, env, db, tg, chatId, 0, msgId);
-    }
-    if (kind === "p") {
-      await ack();
-      if (arg === "rights" || arg === "stats") {
-        return runCommand(ctx, env, db, tg, chatId, arg, []);
-      }
-      const lvl = { home: 0, rules: 1, quick: 2, block: 3, profile: 4, clock: 5 }[arg] ?? 0;
-      return showPanel(ctx, env, db, tg, chatId, lvl, msgId);
-    }
-    if (kind === "rd") {
-      const list = await D.listKv(db, "rules");
-      const i = Number(arg);
-      if (list[i]) { await D.delKv(db, "rules", list[i].kw); await ack(`🗑 ${list[i].kw}`, true); }
-      return showPanel(ctx, env, db, tg, chatId, 1, msgId);
-    }
-    if (kind === "qd") {
-      const list = await D.listKv(db, "quick");
-      const i = Number(arg);
-      if (list[i]) { await D.delKv(db, "quick", list[i].name); await ack(`🗑 ${list[i].name}`, true); }
-      return showPanel(ctx, env, db, tg, chatId, 2, msgId);
-    }
-    if (kind === "ub") {
-      const ids = await D.listBlocked(db);
-      if (ids[Number(arg)]) { await D.unblockUser(db, ids[Number(arg)]); await ack("✅ Unblocked", true); }
-      return showPanel(ctx, env, db, tg, chatId, 3, msgId);
-    }
-    if (kind === "ra" || kind === "qa") {
-      await D.setSetting(db, "_await", kind === "ra" ? "rule" : "quick");
-      await ack("Send it now", true);
-      return tg.sendMessage(chatId, kind === "ra" ? UI.guidedPrompts.rule : UI.guidedPrompts.quick, html());
-    }
-    if (kind === "pr") {
-      if (arg === "rmphoto") { await ack(); return runCommand(ctx, env, db, tg, chatId, "rmphoto", []); }
-      await D.setSetting(db, "_await", arg);
-      await ack("Waiting for your input…", true);
-      return tg.sendMessage(chatId, UI.guidedPrompts[arg] || "Send it now.", html());
-    }
-    if (kind === "cf") {
-      if (arg === "off") {
-        await ack("🔴 Removing clock…", true);
-        return turnClockOff(env, db, tg, chatId);
-      }
-      if (!FONT_NAMES.includes(arg)) return ack("Unknown font", true);
-      const c = await D.connWithRight(db, "can_edit_name");
-      if (!c) return ack("❌ can_edit_name not granted.", true);
-      let base = await D.setting(db, "clock_base_name", "");
-      if (!base) {
-        try {
-          const info = await tg.getBusinessConnection(c.id);
-          base = stripClock(info.user?.first_name || "").slice(0, 64);
-          await D.setSetting(db, "clock_base_name", base);
-        } catch { base = ""; }
-      }
-      const next = buildClockName(base, arg);
-      await D.setSetting(db, "clock_font", arg);
-      await D.setSetting(db, "clock_applied", next);
-      try { await tg.setBusinessAccountName(c.id, next); }
-      catch (e) { return ack(`❌ ${e.message}`, true); }
-      await ack(`🕐 ${next}`, true);
-      return showPanel(ctx, env, db, tg, chatId, 5, msgId);
-    }
-  }
-
-  // ── DM actions ──
-  if (["r", "a", "f", "q", "b", "del"].includes(kind)) {
-    if (!isOwner(env, q.from?.id)) return ack("⛔ Owner only.", true);
-
-    if (kind === "del") {
-      await ack("↩️ Removed.", true);
-      return;
-    }
-    const d = await D.getDraft(db, arg);
-    if (!d) return ack("⚠️ This draft expired — wait for a new DM.", true);
-
-    if (kind === "r") {
-      await D.setReply(db, {
-        owner_id: owner, draft_id: d.id, conn_id: d.conn_id,
-        customer_id: d.customer_id, name: d.name, mode: null,
-      });
-      return ack(`📝 Draft open for ${d.name} — type your reply.`, true);
-    }
-    if (kind === "a") {
-      if (!aiReady(env)) {
-        return ack("⚠️ AI is off — no API key set. Use ✍️ Reply instead.", true);
-      }
-      await D.setReply(db, {
-        owner_id: owner, draft_id: d.id, conn_id: d.conn_id,
-        customer_id: d.customer_id, name: d.name, mode: "ai",
-      });
-      return ack("🤖 AI armed — type your question here.", true);
-    }
-    if (kind === "f") {
-      // re-send in a NEW message; never edit the forward
-      const link = d.username ? `@${d.username}` : `tg://user?id=${d.customer_id}`;
-      await ack();
-      return tg.sendMessage(chatId,
-        `📄 <b>${esc(d.name)}</b> (${link})\n\n${esc(d.text || "(no text)")}`,
-        html({ disable_web_page_preview: true }));
-    }
-    if (kind === "q") {
-      const list = await D.listKv(db, "quick");
-      const item = list[Number(parts[2])];
-      if (!item) return ack("Quick reply not found", true);
-      try {
-        await tg.sendMessage(d.customer_id, item.text, { business_connection_id: d.conn_id });
-        await D.bumpStat(db, "manual");
-        return ack("⚡ Sent.", true);
-      } catch (e) { return ack(`❌ ${e.message}`, true); }
-    }
-    if (kind === "b") {
-      await D.blockUser(db, d.customer_id);
-      await D.dropDraft(db, d.id);
-      await ack(`🚫 ${d.name} blocked.`, true);
-    }
-  }
-
-  return ack();
-}
 
 // ── top-level update dispatch ──────────────────────────────────────────
 
@@ -825,85 +252,60 @@ export async function handleUpdate(ctx, env, update) {
   const tg = makeTelegram(env.BOT_TOKEN);
   tg.__token = env.BOT_TOKEN;
 
-  // ── exactly-once ──
+  // exactly-once: Telegram re-delivers on a slow response
   if (!(await D.claimUpdate(DB, update.update_id))) return;
 
   const m = update.message;
-  const bm = update.business_message;
-
   try {
+    // Keep the connection registry fresh — the clock needs a connection that
+    // was granted can_edit_name.
     if (update.business_connection) {
       const c = update.business_connection;
       if (c.is_enabled) {
-        const rec = {
-          id: c.id, user_id: c.user?.id, user_chat_id: c.user_chat_id,
-          name: c.user?.first_name ? `${c.user.first_name} ${c.user.last_name || ""}`.trim() : "",
+        await D.saveConnection(DB, {
+          id: c.id,
+          user_id: c.user?.id,
+          user_chat_id: c.user_chat_id,
+          name: c.user?.first_name
+            ? `${c.user.first_name} ${c.user.last_name || ""}`.trim() : "",
           rights: c.rights || {},
-        };
-        await D.saveConnection(DB, rec);
-        // multi-user: the account that just connected becomes a known user
-        if (rec.user_id) {
-          try {
-            const { upsertUser } = await import("./users.js");
-            const isOwner = String(rec.user_id) === String(env.OWNER_ID || "");
-            await upsertUser(DB, {
-              user_id: rec.user_id,
-              username: c.user?.username || null,
-              name: rec.name,
-              role: isOwner ? "admin" : "user",
-              is_owner: isOwner ? 1 : 0,
-            });
-            if (!isOwner) {
-              // seed a free plan row so the dashboard renders predictably
-              const { getPlan, grantPlan } = await import("./users.js");
-              if (!(await getPlan(DB, rec.user_id)).tier) {
-                await grantPlan(DB, { user_id: rec.user_id, tier: "free",
-                                      expires_at: 0, note: "auto-created" });
-              }
-            }
-          } catch (e) { console.warn("user registration failed", e.message); }
-        }
-        await ctx.waitUntil(
-          tg.setMyCommands(COMMANDS.map(([command, description]) => ({ command, description })))
-        );
-        if (m) {
-          await tg.sendMessage(m.chat.id,
-            `✅ Connected: <b>${esc(rec.name)}</b>\nRights: <code>${esc(Object.keys(rec.rights || {}).join(", ") || "none")}</code>`,
-            html({ reply_markup: UI.helpKeyboard() }));
-        }
+        });
+        console.log("connected", c.user?.first_name, c.id.slice(0, 12));
       } else {
         await D.dropConnection(DB, c.id);
-        await D.audit(DB, null, "connection.removed", c.id);
+        console.log("disconnected", c.id.slice(0, 12));
       }
       return;
     }
 
-    if (update.callback_query) return await onCallback(ctx, env, DB, tg, update.callback_query);
+    if (update.callback_query) {
+      return await onCallback(ctx, env, DB, tg, update.callback_query);
+    }
 
-    if (bm) return await handleBusinessMessage(ctx, env, DB, tg, bm);
+    // Inbound DMs: marked read and then dropped. Nothing is stored, forwarded,
+    // logged, or answered.
+    if (update.business_message) {
+      await handleBusinessMessage(ctx, env, DB, tg, update.business_message);
+      return;
+    }
 
-    if (m) {
-      const text = m.text || "";
-      const isCmd = text.startsWith("/");
-      const cmd = isCmd ? text.slice(1).split("@")[0].toLowerCase() : "";
-      const args = isCmd ? text.slice(1).split("@")[0].split(/\s+/).slice(1) : [];
-
-      // /photo arrives as a caption on a photo
-      if (m.photo && m.caption && /^\/photo/.test(m.caption)) {
-        return await handlePhoto(ctx, env, DB, tg, m);
+    if (m && m.text) {
+      const text = m.text.trim();
+      if (text.startsWith("/clock") || text.startsWith("/start") ||
+          text.startsWith("/help") || text.startsWith("/test")) {
+        const parts = text.slice(1).split(/\s+/);
+        const cmd = parts[0].split("@")[0].toLowerCase();
+        return await runCommand(ctx, env, DB, tg, m.chat.id, cmd, parts.slice(1));
       }
-      if (isCmd) return await runCommand(ctx, env, DB, tg, m.chat.id, cmd, args);
-      if (OWNER(env) && m.chat.id === OWNER(env)) return await handleOwnerText(ctx, env, DB, tg, m);
     }
   } catch (e) {
-    // Log and swallow: the HTTP response is already 200 and a retry would
-    // double-deliver. The audit row is the only trace.
+    // The HTTP response is already 200 and a retry would double-deliver, so
+    // swallow here and leave one audit row as the only trace.
     await D.audit(DB, null, "update.error", `${update.update_id}: ${e.message}`);
     console.error("update failed", update.update_id, e);
   }
 }
-
-// ── the tick: clock + housekeeping ──────────────────────────────────────
+// ── the tick: clock + housekeeping ────────────────────────────────────
 // Runs from the cron trigger AND from /health or /tick, because a scheduled
 // trigger can fail to attach (missing scope, or a deploy that drops it). Being
 // able to drive it from ordinary traffic is what makes the clock self-healing.

@@ -57,5 +57,32 @@ CREATE TABLE IF NOT EXISTS code_uses (
 CREATE INDEX IF NOT EXISTS idx_code_uses_hash ON code_uses(code_hash);
 CREATE INDEX IF NOT EXISTS idx_code_uses_user ON code_uses(user_id);
 
+-- ── announcements (admin broadcast) ───────────────────────────────────
+-- Compose once, deliver to every connected account. `sent_at` is null until
+-- delivered, so a partially-sent broadcast can be resumed safely.
+CREATE TABLE IF NOT EXISTS announcements (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  title       TEXT NOT NULL DEFAULT '',
+  body        TEXT NOT NULL,
+  target      TEXT NOT NULL DEFAULT 'all',  -- 'all' | 'paid' | 'free' | 'admin'
+  created_by  INTEGER,
+  created_at  INTEGER NOT NULL,
+  sent_at     INTEGER,
+  recipients  INTEGER NOT NULL DEFAULT 0,
+  ok_count    INTEGER NOT NULL DEFAULT 0,
+  fail_count  INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_ann_created ON announcements(created_at);
+
+-- ── daily stat snapshots, so the admin graph is not just a live counter ──
+CREATE TABLE IF NOT EXISTS stat_daily (
+  day     TEXT PRIMARY KEY,          -- YYYY-MM-DD (UTC)
+  dms     INTEGER NOT NULL DEFAULT 0,
+  ai      INTEGER NOT NULL DEFAULT 0,
+  manual  INTEGER NOT NULL DEFAULT 0,
+  rules   INTEGER NOT NULL DEFAULT 0,
+  blocked INTEGER NOT NULL DEFAULT 0
+);
+
 -- ── per-chat mode overrides become per-user too ───────────────────────
 -- pins.k already carries "<conn_id>:<chat_id>" so it is already per-account.
