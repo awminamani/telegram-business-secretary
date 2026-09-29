@@ -120,9 +120,6 @@ export function makeTelegram(token) {
 
     editMessageText: (text, extra = {}) => call("editMessageText", { text, ...extra }),
 
-    readBusinessMessage: (business_connection_id, chat_id, message_id) =>
-      call("readBusinessMessage", { business_connection_id, chat_id, message_id }),
-
     deleteBusinessMessages: (business_connection_id, message_ids) =>
       call("deleteBusinessMessages", { business_connection_id, message_ids }),
 

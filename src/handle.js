@@ -95,16 +95,18 @@ async function onCallback(ctx, env, db, tg, q) {
   }
 }
 
-// ── inbound DMs: nothing is read, stored, forwarded or answered ────────
+// ── inbound DMs: completely ignored ────────────────────────────────────
+// No forwarding, no AI reply, and NOT marked as read either.
+//
+// Marking a DM read is not a neutral act: it clears the unread badge in the
+// sender's chat, so they see "read" and reasonably conclude you saw the message
+// and chose to ignore them. That is exactly the "they think I ghosted them"
+// problem, so the bot must not touch the read state at all. It keeps no record
+// and produces no visible effect of any kind.
 async function handleBusinessMessage(ctx, env, db, tg, m) {
-  // DM forwarding and AI replies were removed. A customer message is marked
-  // read (so the badge stays tidy) and then dropped. Nothing is stored.
-  const conn = await ensureConn(db, tg, m.business_connection_id);
-  if (conn?.rights?.can_read_messages) {
-    try {
-      await tg.readBusinessMessage(conn.id, m.chat.id, m.message_id);
-    } catch { /* non-fatal */ }
-  }
+  // Intentionally empty. Kept as a function so handleUpdate has one obvious
+  // place where inbound DMs are acknowledged-and-dropped.
+  void m;
 }
 
 // ── commands ───────────────────────────────────────────────────────────

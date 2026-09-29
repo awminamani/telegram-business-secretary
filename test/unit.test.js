@@ -88,13 +88,23 @@ test("THE GUARANTEE: no DM forwarding, no AI auto-reply anywhere", () => {
   }
 });
 
-test("inbound DMs are dropped, not forwarded", () => {
+test("inbound DMs are left completely alone (not even marked read)", () => {
   const h = readFileSync(join(src, "handle.js"), "utf8");
   const fn = h.slice(h.indexOf("async function handleBusinessMessage("));
   const body = fn.slice(0, fn.indexOf("\n}\n"));
-  assert.ok(body.includes("readBusinessMessage"), "should still mark read");
-  assert.ok(!/sendMessage|reply_safe/.test(body),
-    "the DM handler must not send anything to the owner or a customer");
+  // Marking a DM read clears the unread badge in the SENDER's chat, so they see
+  // "read" and think you ignored them. The bot must not touch it.
+  assert.ok(!body.includes("readBusinessMessage"),
+    "must NOT mark DMs as read — that is what made friends think they were ghosted");
+  assert.ok(!/sendMessage|reply_safe|readBusiness/.test(body),
+    "the DM handler must have no visible effect at all");
+});
+
+test("nothing in the codebase can mark a DM as read", () => {
+  const all = ["handle.js", "worker.js", "telegram.js", "db.js", "clock.js"]
+    .map((f) => readFileSync(join(src, f), "utf8")).join("\n");
+  assert.ok(!/readBusinessMessage/.test(all),
+    "readBusinessMessage must not be called anywhere");
 });
 
 test("the command menu is clock-only", () => {

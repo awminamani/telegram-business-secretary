@@ -11,9 +11,13 @@ long polling, no server to maintain.
 - ❌ No DM forwarding
 - ❌ No AI auto-replies
 - ❌ No reading, storing, or answering anyone's private messages
+- ❌ **It does not even mark them as read**
 
-An inbound DM is marked read and then dropped. Nobody receives a message the
-bot wrote on its own. These are enforced by tests, not just by intention.
+An inbound DM is ignored completely: nothing is stored, nothing is forwarded,
+and the read state is left untouched. Marking a DM read is not neutral — it
+clears the unread badge in the *sender's* chat, so they see "read" and
+reasonably conclude you ignored them. That is the "my friends think I ghosted
+them" failure, so the bot does not do it. All of this is enforced by tests.
 
 ## Setup
 
