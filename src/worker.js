@@ -27,8 +27,12 @@ import { handleUpdate, handleScheduled, runTick, COMMANDS } from "./handle.js";
 import { tehranISO, clockPreview } from "./clock.js";
 import { aiReady } from "./ai.js";
 import * as D from "./db.js";
+import { allUsers } from "./users.js";
 
 const MAX_BODY = 1_048_576;      // 1 MiB — Telegram updates are tiny
+// Secret used to HMAC redeem codes. Falls back to WEBHOOK_SECRET so an existing
+// deployment keeps working; set a dedicated CODE_SECRET to separate concerns.
+const codeSecret = (env) => env.CODE_SECRET || env.WEBHOOK_SECRET || "dev-only-secret";
 const ALLOWED_UPDATES = [
   "message", "edited_message", "callback_query", "business_connection",
   "business_message", "edited_business_message", "deleted_business_messages",
@@ -145,7 +149,7 @@ export default {
         // 6. answer IMMEDIATELY; the LLM/send work continues in waitUntil so a
         //    slow response can never make Telegram re-deliver this update.
         ctx.waitUntil(
-          handleUpdate(ctx, env, update).catch(async (e) => {
+          handleUpdate(ctx, { ...env, CODE_SECRET: codeSecret(env) }, update).catch(async (e) => {
             console.error("handler crashed", e);
             await D.audit(env.DB, null, "update.crash", String(e?.message || e));
           })
@@ -224,6 +228,7 @@ export default {
           clock: clockPreview(await D.setting(env.DB, "clock_font", "mono")),
           ai: aiReady(env),
           connections: (await D.allConnections(env.DB)).length,
+          users: (await allUsers(env.DB)).length,
           stats: await D.allStats(env.DB),
         });
       }
@@ -231,7 +236,7 @@ export default {
       if (url.pathname === "/health") {
         // Uptime monitors hit this constantly, so let it drive the clock too:
         // if the cron trigger failed to attach, traffic alone keeps time fresh.
-        const tick = await runTick(env);
+        const tick = await runTick({ ...env, CODE_SECRET: codeSecret(env) });
         return json({ ok: true, tehran: tehranISO(), ...tick });
       }
 
@@ -241,7 +246,7 @@ export default {
       // trigger). This endpoint makes the clock self-healing: ANY request can
       // drive the tick, and /health is polled by uptime checks anyway.
       if (url.pathname === "/tick") {
-        const res = await runTick(env);
+        const res = await runTick({ ...env, CODE_SECRET: codeSecret(env) });
         return json({ ok: true, ...res });
       }
 
@@ -273,7 +278,7 @@ export default {
   // the cron that stands in for a long-polling bot's background loop
   async scheduled(event, env, ctx) {
     try {
-      await handleScheduled(ctx, env);
+      await handleScheduled(ctx, { ...env, CODE_SECRET: codeSecret(env) });
     } catch (e) {
       console.error("scheduled failed", e);
     }

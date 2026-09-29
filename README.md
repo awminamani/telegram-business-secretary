@@ -126,10 +126,45 @@ correct regardless of where the Worker runs.
 
 ---
 
+## Multi-user
+
+Any account that connects the bot becomes a user, with a plan tier gating the
+premium features. **Everything is buttons** — send `/home` (or tap the panel
+button) to open your dashboard.
+
+| Tier | Features |
+|---|---|
+| 🆓 Free | DM forwarding, reply buttons, keyword rules, quick replies, blocklist |
+| ⚡ Pro | + profile editing, the Tehran clock in your name |
+| 💎 Premium | + AI auto-replies, per-thread mode pin, activity log |
+
+**Users:** pick a font for **your own** account, toggle DM forwarding, switch
+modes, manage rules and quick replies. Per-user clock: every user has their own
+font and base name, and the tick serves each independently.
+
+**Admins** (you, plus anyone you promote) get a second dashboard: list users,
+tap one to grant/revoke/extend their plan, issue a code for a specific person,
+generate time-limited codes, read the audit log, see stats.
+
+### Redeem codes
+Admins generate codes: choose a tier, a validity window (1h / 1d / 7d / 30d /
+never) and optionally bind one to a specific user id. Codes are shown once and
+stored **hashed** (HMAC), so a leaked database can't be turned back into working
+codes; a fully-used code is erased. Users redeem by tapping **🎟 Redeem a code**
+and sending the code — it is case- and dash-insensitive, single-use by default,
+and unlocks the features until it expires.
+
+A lapsed plan falls back to **Free** (DM forwarding keeps working), never to
+nothing. The owner always has full access.
+
 ## Layout
 
 ```
 src/worker.js    fetch handler: routing + the security gate
+src/users.js     multi-user: users, plans, per-user settings, codes
+src/plans.js     tier/feature matrix, code generation + HMAC
+src/dash.js      the button dashboards (user + admin)
+src/multiuser.js dashboard callbacks, guided input, per-user clock
 src/handle.js    update handling, modes, commands, callbacks, cron
 src/db.js        D1 data layer (every query lives here)
 src/telegram.js  Bot API client + secret-token compare
@@ -138,7 +173,11 @@ src/ai.js        OpenRouter (optional, degrades safely)
 src/ui.js        keyboards, panel, /help
 schema.sql       D1 schema
 migrations/      same schema, applied by wrangler
-test/            24 tests: security, idempotency, clock, escaping, real SQL
+test/            57 tests: security, idempotency, clock, escaping, real SQL,
+                 multi-user plans, code redemption, per-user settings
+tools/check_refs.mjs  catches "called but never defined" (e.g. log.info in a
+                 module with only console) — passes --check and unit tests, then
+                 throws on the first real request
 ```
 
 ```bash

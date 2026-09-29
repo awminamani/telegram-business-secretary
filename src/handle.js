@@ -25,6 +25,12 @@ const isOwner = (env, id) => !!OWNER(env) && Number(id) === OWNER(env);
 
 const html = (extra = {}) => ({ parse_mode: "HTML", ...extra });
 
+// Callback prefixes handled by the multi-user dashboard layer.
+const MULTI_KINDS = new Set([
+  "t", "m", "p", "cf", "rd", "qd", "ub", "ra", "qa", "pr", "hx",
+  "a", "au", "ap", "ac", "ad", "ng", "nv", "x",
+]);
+
 // ── connection self-heal ───────────────────────────────────────────────
 
 /** Look up a connection; if unknown, fetch + register it from the API. */
@@ -52,6 +58,9 @@ async function ensureConn(db, tg, connId) {
 // ── the forwarded DM ───────────────────────────────────────────────────
 
 async function forwardToOwner(ctx, env, db, tg, conn, m) {
+  // The account that should be notified is the one that owns this business
+  // connection, not a hard-coded chat id — that is what makes multi-user work.
+  const ownerChat = conn.user_chat_id || conn.user_id;
   const customerId = m.chat.id;
   const name = m.chat.full_name || m.chat.title || m.from_user?.first_name || "Unknown";
   const username = m.from_user?.username || m.chat?.username || "";
@@ -72,14 +81,14 @@ async function forwardToOwner(ctx, env, db, tg, conn, m) {
   common.reply_markup.inline_keyboard.push([UI.profileButton(username, customerId)]);
 
   const send = async () => {
-    if (m.text) return tg.sendMessage(OWNER(env), text, common);
-    if (m.photo) return tg.sendPhoto(OWNER(env), m.photo.at(-1).file_id, { ...common, caption: `${head}🖼️ Photo${m.caption ? "\n" + m.caption : ""}` });
-    if (m.voice) return tg.sendVoice(OWNER(env), m.voice.file_id, { ...common, caption: `${head}🎙️ Voice` });
-    if (m.video) return tg.sendVideo(OWNER(env), m.video.file_id, { ...common, caption: `${head}🎬 Video` });
-    if (m.document) return tg.sendDocument(OWNER(env), m.document.file_id, { ...common, caption: `${head}📄 ${m.document.file_name || "document"}` });
-    if (m.audio) return tg.sendAudio(OWNER(env), m.audio.file_id, { ...common, caption: `${head}🎵 Audio` });
-    if (m.sticker) return tg.sendSticker(OWNER(env), m.sticker.file_id, { ...common });
-    return tg.sendMessage(OWNER(env), `${head}📦 media`, common);
+    if (m.text) return tg.sendMessage(ownerChat, text, common);
+    if (m.photo) return tg.sendPhoto(ownerChat, m.photo.at(-1).file_id, { ...common, caption: `${head}🖼️ Photo${m.caption ? "\n" + m.caption : ""}` });
+    if (m.voice) return tg.sendVoice(ownerChat, m.voice.file_id, { ...common, caption: `${head}🎙️ Voice` });
+    if (m.video) return tg.sendVideo(ownerChat, m.video.file_id, { ...common, caption: `${head}🎬 Video` });
+    if (m.document) return tg.sendDocument(ownerChat, m.document.file_id, { ...common, caption: `${head}📄 ${m.document.file_name || "document"}` });
+    if (m.audio) return tg.sendAudio(ownerChat, m.audio.file_id, { ...common, caption: `${head}🎵 Audio` });
+    if (m.sticker) return tg.sendSticker(ownerChat, m.sticker.file_id, { ...common });
+    return tg.sendMessage(ownerChat, `${head}📦 media`, common);
   };
   return send();
 }
@@ -90,12 +99,15 @@ async function handleBusinessMessage(ctx, env, db, tg, m) {
   if (!conn.rights?.can_reply) return;
   if (OWNER(env) && m.from_user?.id === OWNER(env)) return;   // never echo the owner
 
-  // ── DM listening off ──
-  // Swallow silently: the message is still marked read (so the owner's badge is
-  // tidy) but they are never pinged and the customer is never auto-answered.
-  // The bot itself stays fully alive for commands, the panel and the clock.
-  if ((await D.setting(db, "listen_dm", "on")) === "off") {
-    log.info(`[dm listening off] ignored a DM from ${m.chat?.id}`);
+  // Per-user settings: the connection's user_id is the account that receives
+  // these DMs, so their listen/mode/clock are used — not the global ones.
+  const uid = conn.user_id;
+
+  // ── DM listening off (per user) ──
+  // Swallow silently: the message is still marked read (so the badge is tidy)
+  // but the owner is never pinged and the customer is never auto-answered.
+  if ((await D.setting(db, "listen_dm", "on", uid)) === "off") {
+    console.info(`[dm listening off] ignored a DM from ${m.chat?.id}`);
     if (conn.rights?.can_read_messages) {
       try {
         await tg.readBusinessMessage(conn.id, m.chat.id, m.message_id);
@@ -117,7 +129,7 @@ async function handleBusinessMessage(ctx, env, db, tg, m) {
   }
 
   const pinKey = `${conn.id}:${m.chat.id}`;
-  const mode = (await D.getPin(db, pinKey)) || (await D.setting(db, "mode", "manual"));
+  const mode = (await D.getPin(db, pinKey)) || (await D.setting(db, "mode", "manual", uid));
   if (mode === "off") return;
 
   const text = m.text || m.caption || "";
@@ -131,8 +143,8 @@ async function handleBusinessMessage(ctx, env, db, tg, m) {
       await D.bumpStat(db, "rules");
       try {
         await tg.sendMessage(m.chat.id, hit.reply, { business_connection_id: conn.id });
-        if ((await D.setting(db, "notify_ai", "1")) === "1") {
-          await tg.sendMessage(OWNER(env), `⚡ Rule answered for <b>${esc(m.chat.full_name || "user")}</b>:\n${esc(hit.reply)}`, html());
+        if ((await D.setting(db, "notify_ai", "1", uid)) === "1") {
+          await tg.sendMessage(conn.user_chat_id || uid, `⚡ Rule answered for <b>${esc(m.chat.full_name || "user")}</b>:\n${esc(hit.reply)}`, html());
         }
       } catch { /* reported upstream */ }
       return;
@@ -143,7 +155,7 @@ async function handleBusinessMessage(ctx, env, db, tg, m) {
   let effective = mode;
   if (effective === "ai" && !aiReady(env)) {
     effective = "manual";
-    await D.setSetting(db, "mode", "manual");
+    await D.setSetting(db, "mode", "manual", uid);
   }
   if (effective === "ai") {
     if (!text) return forwardToOwner(ctx, env, db, tg, conn, { ...m, text: `${text}📦 media`, caption: null });
@@ -176,8 +188,8 @@ async function handleBusinessMessage(ctx, env, db, tg, m) {
       // no parse_mode: an LLM stray "_" must never cost us the reply
       await tg.sendMessage(m.chat.id, reply, { business_connection_id: conn.id });
       await D.bumpStat(db, "ai");
-      if ((await D.setting(db, "notify_ai", "1")) === "1") {
-        await tg.sendMessage(OWNER(env), `🤖 AI → <b>${esc(m.chat.full_name || "user")}</b>\n${esc(reply)}`, html());
+      if ((await D.setting(db, "notify_ai", "1", uid)) === "1") {
+        await tg.sendMessage(conn.user_chat_id || uid, `🤖 AI → <b>${esc(m.chat.full_name || "user")}</b>\n${esc(reply)}`, html());
       }
     } catch (e) {
       return forwardToOwner(ctx, env, db, tg, conn, { ...m, text: `⚠️ send failed: ${e.message}`, caption: null });
@@ -214,8 +226,17 @@ async function deliverReply(ctx, env, db, tg, st, text) {
 async function handleOwnerText(ctx, env, db, tg, m) {
   const owner = OWNER(env);
 
+  // ── multi-user guided input FIRST (redeem / new code / per-user settings) ──
+  if (m.text) {
+    try {
+      const { setTelegram, onGuided } = await import("./multiuser.js");
+      setTelegram(tg);
+      if (await onGuided(env, db, tg, OWNER(env), OWNER(env), m.text)) return;
+    } catch (e) { console.warn("guided input failed", e.message); }
+  }
+
   // guided input from the panel (Add rule / Add quick / profile fields)
-  const awaitKey = await D.setting(db, "_await", "");
+  const awaitKey = await D.setting(db, "_await", "", owner);
   if (awaitKey && m.text) {
     await D.setSetting(db, "_await", "");
     const raw = m.text.trim();
@@ -290,6 +311,8 @@ const COMMANDS = [
   ["photo", "profile photo"], ["rmphoto", "remove photo"], ["rights", "granted rights"],
   ["test", "health check"], ["cancel", "close draft"], ["forget", "clear AI memory"],
   ["listen", "turn DM forwarding on/off"],
+  ["home", "open your button dashboard"], ["admin", "admin dashboard (admins)"],
+  ["redeem", "redeem a plan code"],
 ];
 
 async function runCommand(ctx, env, db, tg, chatId, cmd, args) {
@@ -353,6 +376,23 @@ async function runCommand(ctx, env, db, tg, chatId, cmd, args) {
         return `👤 ${esc(c.name || "?")} (<code>${c.user_id}</code>)\nconn <code>${c.id.slice(0, 16)}…</code>\n${rs}`;
       }).join("\n\n");
       return tg.sendMessage(chatId, out, html());
+    }
+    case "home":
+    case "menu": {
+      const { setTelegram, renderUserHome } = await import("./multiuser.js");
+      setTelegram(tg);
+      return renderUserHome(env, db, chatId, chatId);
+    }
+    case "admin": {
+      const { setTelegram, userContext, showPanel } = await import("./multiuser.js");
+      setTelegram(tg);
+      const ent = await userContext(env, db, chatId);
+      if (!ent.isAdmin) return tg.sendMessage(chatId, "⛔ Admin only.", html());
+      return showPanel(env, db, tg, chatId, chatId, "admin");
+    }
+    case "redeem": {
+      await D.setSetting(db, "_await", "redeem", chatId);
+      return tg.sendMessage(chatId, "🎟 Send me your code.", html());
     }
     case "listen": {
       const cur = await D.setting(db, "listen_dm", "on");
@@ -627,6 +667,15 @@ async function onCallback(ctx, env, db, tg, q) {
   const msgId = q.message?.message_id;
   const ack = (text, alert = false) => tg.answerCallback(q.id, text, alert);
 
+  // ── multi-user dashboards own these prefixes ──
+  // Single-letter kinds that the legacy panel also uses are handled here, so
+  // the new button UI works for every user, not just the owner.
+  if (MULTI_KINDS.has(kind)) {
+    const { setTelegram, onDashCallback } = await import("./multiuser.js");
+    setTelegram(tg);
+    return onDashCallback(env, db, q, q.from?.id ?? owner);
+  }
+
   if (kind === "hx") {
     await ack();
     return tg.sendMessage(chatId, UI.helpText(), html());
@@ -792,6 +841,28 @@ export async function handleUpdate(ctx, env, update) {
           rights: c.rights || {},
         };
         await D.saveConnection(DB, rec);
+        // multi-user: the account that just connected becomes a known user
+        if (rec.user_id) {
+          try {
+            const { upsertUser } = await import("./users.js");
+            const isOwner = String(rec.user_id) === String(env.OWNER_ID || "");
+            await upsertUser(DB, {
+              user_id: rec.user_id,
+              username: c.user?.username || null,
+              name: rec.name,
+              role: isOwner ? "admin" : "user",
+              is_owner: isOwner ? 1 : 0,
+            });
+            if (!isOwner) {
+              // seed a free plan row so the dashboard renders predictably
+              const { getPlan, grantPlan } = await import("./users.js");
+              if (!(await getPlan(DB, rec.user_id)).tier) {
+                await grantPlan(DB, { user_id: rec.user_id, tier: "free",
+                                      expires_at: 0, note: "auto-created" });
+              }
+            }
+          } catch (e) { console.warn("user registration failed", e.message); }
+        }
         await ctx.waitUntil(
           tg.setMyCommands(COMMANDS.map(([command, description]) => ({ command, description })))
         );
@@ -863,33 +934,25 @@ export async function runTick(env) {
     out.housekeeping = true;
   }
 
-  // ── the clock ──
-  const font = s.clock_font || "";
-  if (!font) return out;
-  out.clock = font;
+  // ── the clock: one job per user who enabled it ──
+  // Each user has their own scoped clock_font/clock_base_name, so the tick
+  // serves every clock independently instead of a single global one.
+  const jobs = await D.clockJobs(DB);
+  out.clock_users = jobs.length;
+  if (!jobs.length) return out;
 
-  const want = buildClockName(stripClock(s.clock_base_name || ""), font);
-
-  // THE request saving: only call Telegram when the rendered name differs from
-  // what we last wrote. Before, a tick that changed nothing still burned a
-  // setBusinessAccountName call (or a compare against a separately-read value).
-  if (want === (s.clock_applied || "")) return out;
-
-  const c = s.name_conn_id
-    ? { id: s.name_conn_id }
-    : await D.connWithRight(DB, "can_edit_name");
-  if (!c) {
-    out.clock_error = "can_edit_name not granted";
-    return out;
-  }
-  try {
-    const tg = makeTelegram(env.BOT_TOKEN);
-    await tg.setBusinessAccountName(c.id, want);
-    await D.setSetting(DB, "clock_applied", want);
-    out.wrote = true;
-  } catch (e) {
-    out.clock_error = e.message;
-    console.warn("clock tick failed", e.message);
+  for (const job of jobs) {
+    const want = buildClockName(stripClock(job.base), job.font);
+    if (want === (await D.setting(DB, "clock_applied", "", job.uid))) continue;
+    try {
+      const tg = makeTelegram(env.BOT_TOKEN);
+      await tg.setBusinessAccountName(job.connId, want);
+      await D.setSetting(DB, "clock_applied", want, job.uid);
+      out.wrote = (out.wrote || 0) + 1;
+    } catch (e) {
+      out.clock_error = e.message;
+      console.warn("clock tick failed", job.uid, e.message);
+    }
   }
   return out;
 }

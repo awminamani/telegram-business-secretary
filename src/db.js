@@ -246,6 +246,41 @@ export async function tickState(db) {
 }
 
 
+// ── per-user clock jobs ───────────────────────────────────────────────
+// One job per user who enabled a clock. Each user's font/base name is stored
+// under "<key>:<user_id>", so the tick serves every clock independently.
+export async function clockJobs(db) {
+  const { results: conns } = await db.prepare(
+    "SELECT conn_id, user_id FROM connections WHERE enabled = 1").all();
+  if (!conns.length) return [];
+
+  // settings keys look like "clock_font:123"; pull them all in one query
+  const { results: rows } = await db.prepare(
+    `SELECT key, value FROM settings
+      WHERE key LIKE 'clock\_font:%' ESCAPE '\\'
+         OR key LIKE 'clock\_base\_name:%' ESCAPE '\\'
+         OR key LIKE 'clock\_applied:%' ESCAPE '\\'`).all();
+  const byUser = {};
+  for (const r of rows) {
+    const m = r.key.match(/^([a-z_]+):(\d+)$/);
+    if (!m) continue;
+    const [, k, uid] = m;
+    (byUser[uid] ||= {})[k] = r.value;
+  }
+  const jobs = [];
+  for (const c of conns) {
+    const s = byUser[String(c.user_id)] || {};
+    if (!s.clock_font || !s.clock_base_name) continue;
+    jobs.push({
+      connId: c.conn_id, uid: c.user_id,
+      font: s.clock_font, base: s.clock_base_name,
+      applied: s.clock_applied || "",
+    });
+  }
+  return jobs;
+}
+
+
 // ── AI history (bounded) ───────────────────────────────────────────────
 
 const HIST_MAX_PER_THREAD = 40;
